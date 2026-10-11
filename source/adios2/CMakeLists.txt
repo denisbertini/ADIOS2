@@ -337,6 +337,14 @@ if(ADIOS2_HAVE_DAOS)
   target_link_libraries(adios2_core PRIVATE DAOS::DAOS ${maybe_CaliperLib})
 endif()
 
+if(NOT WIN32)
+  # bbview: daemonless view-aware burst buffer engine (POSIX-only staging)
+  target_sources(adios2_core PRIVATE
+    engine/bbview/BbviewWriter.cpp
+  )
+  target_compile_definitions(adios2_core PRIVATE ADIOS2_HAVE_BBVIEW)
+endif()
+
 if(ADIOS2_HAVE_MPI)
   add_library(adios2_core_mpi
     core/IOMPI.cpp

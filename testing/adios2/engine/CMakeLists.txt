@@ -9,6 +9,7 @@
 
 add_subdirectory(bp)
 add_subdirectory(skeleton)
+add_subdirectory(bbview)
 add_subdirectory(inline)
 add_subdirectory(null)
 add_subdirectory(nullcore)

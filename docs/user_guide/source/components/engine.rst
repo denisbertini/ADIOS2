@@ -600,6 +600,11 @@ If the ``SetEngine`` function is not invoked the default engine is the ``BPFile`
      - BP5
      - Default engine for reading and writing ADIOS2 native ``.bp`` files
    * - File
+     - BBView
+     - | Daemonless view-aware burst buffer writer producing standard BP5:
+       | steps stage on node-local SSD and drain asynchronously to the
+       | final store; metadata commits only after data has landed.
+   * - File
      - HDF5
      - Read/write HDF5 files through the ADIOS2 API
    * - Staging

@@ -24,6 +24,9 @@
 #include "adios2/engine/bp4/BP4Writer.h"
 #include "adios2/engine/bp5/BP5Reader.h"
 #include "adios2/engine/bp5/BP5Writer.h"
+#ifdef ADIOS2_HAVE_BBVIEW
+#include "adios2/engine/bbview/BbviewWriter.h"
+#endif
 #include "adios2/engine/inline/InlineReader.h"
 #include "adios2/engine/inline/InlineWriter.h"
 #include "adios2/engine/mhs/MhsReader.h"
@@ -89,6 +92,17 @@ std::unordered_map<std::string, IO::EngineFactoryEntry> Factory = {
 #else
      IO::NoEngineEntry("ERROR: this version didn't compile with "
                        "DataMan library, can't use DataMan engine\n")
+#endif
+    },
+    {"bbview",
+#ifdef ADIOS2_HAVE_BBVIEW
+     // read side is the standard BP5 reader: bbview writes standard BP5
+     // files, with per-step metadata committed only once the step's data
+     // has drained from the node-local burst buffer to the final store
+     {IO::MakeEngine<engine::BP5Reader>, IO::MakeEngine<engine::BbviewWriter>}
+#else
+     IO::NoEngineEntry("ERROR: this version didn't compile with "
+                       "the bbview engine (POSIX only)\n")
 #endif
     },
     {"ssc", IO::NoEngineEntry("ERROR: this version didn't compile with "
@@ -158,11 +172,11 @@ std::unordered_map<std::string, IO::EngineFactoryEntry> Factory = {
 };
 
 const std::unordered_map<std::string, bool> ReadRandomAccess_Supported = {
-    {"bp3", false},     {"bp4", false},        {"bp5", true},      {"dataman", false},
-    {"ssc", false},     {"mhs", false},        {"sst", false},     {"daos", false},
-    {"effis", false},   {"dataspaces", false}, {"hdf5", false},    {"skeleton", true},
-    {"inline", false},  {"null", true},        {"nullcore", true}, {"plugin", false},
-    {"campaign", true}, {"timeseries", true},
+    {"bp3", false},     {"bp4", false},        {"bp5", true},      {"bbview", true},
+    {"dataman", false}, {"ssc", false},        {"mhs", false},     {"sst", false},
+    {"daos", false},    {"effis", false},      {"dataspaces", false},
+    {"hdf5", false},    {"skeleton", true},    {"inline", false},  {"null", true},
+    {"nullcore", true}, {"plugin", false},     {"campaign", true}, {"timeseries", true},
 };
 
 // Synchronize access to the factory in case one thread is
