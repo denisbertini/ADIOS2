@@ -310,17 +310,14 @@ void BbviewWriter::InitTransports()
     }
     m_Host = hostname;
 
-    // initial drain progress marker for this rank: a single fixed-size
-    // seqlock record, created once and updated in place (see WriteProgress)
+    // drain progress marker for this rank: a single fixed-size seqlock
+    // record. Created lazily by the first real progress update (first drain
+    // completion) instead of here: the initial create+write is a pure MDT
+    // round trip on the open critical path, and on the test cluster its stall
+    // tail (observed 0.1-2 s on Lustre) dominated Open. The committer treats
+    // a missing progress file as "progress 0", which is exactly the initial
+    // state, so nothing depends on the file existing after Open.
     m_ProgressPath = finalDir + "/bbview.drain." + std::to_string(m_RankMPI);
-    m_ProgressFd =
-        open(m_ProgressPath.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-    if (m_ProgressFd < 0)
-    {
-        ThrowPosix("create progress file " + m_ProgressPath + " (rank " +
-                   std::to_string(m_RankMPI) + ", host " + m_Host + ")");
-    }
-    WriteProgress(0, 0);
     openPhase("progress-file");
     m_MetaDataPos = 0; // BP5 md.0 carries no header in this format version
 
@@ -787,6 +784,19 @@ void BbviewWriter::WaitForAllRanksDrained(size_t step)
 
 void BbviewWriter::WriteProgress(uint64_t drainedSteps, uint64_t drainedBytes)
 {
+    // Called under m_Mutex, so no two threads can race the lazy create. The
+    // open is deliberately off the open critical path: it happens on a drain
+    // thread after the first drained step, mid-run.
+    if (m_ProgressFd < 0)
+    {
+        m_ProgressFd =
+            open(m_ProgressPath.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (m_ProgressFd < 0)
+        {
+            ThrowPosix("create progress file " + m_ProgressPath + " (rank " +
+                       std::to_string(m_RankMPI) + ", host " + m_Host + ")");
+        }
+    }
     DrainProgress p;
     p.Rank = static_cast<uint64_t>(m_RankMPI);
     p.DrainedSteps = drainedSteps;
