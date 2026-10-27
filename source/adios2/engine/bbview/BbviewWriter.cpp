@@ -232,6 +232,18 @@ void BbviewWriter::InitParameters()
 
 void BbviewWriter::InitTransports()
 {
+    // TEMPORARY: open-phase profiling to diagnose multi-second Open on the
+    // test cluster. One line per rank to stderr; remove after diagnosis.
+    const auto tOpenStart = std::chrono::steady_clock::now();
+    const auto openPhase = [this, tOpenStart](const char *phase) {
+        const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - tOpenStart)
+                              .count();
+        std::cerr << "bbview rank " << m_RankMPI << " open-phase " << phase << " @"
+                  << static_cast<long long>(ms) << " ms\n";
+        std::cerr.flush();
+    };
+
     const std::string finalDir = m_Name;
     const std::string mdFile = GetBPMetadataFileName(m_Name);
     const std::string mmdFile = GetBPMetaMetadataFileNames({m_Name})[0];
@@ -253,6 +265,7 @@ void BbviewWriter::InitTransports()
         }
         helper::CleanupBPDirectory(finalDir, filesToKeep, m_Comm);
     }
+    openPhase("cleanup");
 
     if (m_RankMPI == 0)
     {
@@ -265,7 +278,9 @@ void BbviewWriter::InitTransports()
         m_MDIndexFile = transport::OpenFile(m_Comm, mdIdxFile, m_OpenMode, tp, true);
         WriteIndexHeaderAndWriterMap();
     }
+    openPhase("rank0-md-files");
     m_Comm.Barrier();
+    openPhase("barrier1");
 
     // final data sub-file: raw fd, only drain threads pwrite into it
     m_DataFd = open(m_DataFileName.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
@@ -273,6 +288,7 @@ void BbviewWriter::InitTransports()
     {
         ThrowPosix("open of data sub-file " + m_DataFileName);
     }
+    openPhase("data-fd");
 
     // node-local burst buffer staging directory; file names carry the rank so
     // that multiple ranks sharing a node never clobber each other's steps
@@ -285,6 +301,7 @@ void BbviewWriter::InitTransports()
                                           "cannot create burst buffer staging directory " +
                                               m_StagingDir + ": " + ec.message());
     }
+    openPhase("staging-mkdir");
 
     char hostname[256] = {0};
     if (gethostname(hostname, sizeof(hostname) - 1) != 0)
@@ -304,10 +321,13 @@ void BbviewWriter::InitTransports()
                    std::to_string(m_RankMPI) + ", host " + m_Host + ")");
     }
     WriteProgress(0, 0);
+    openPhase("progress-file");
     m_MetaDataPos = 0; // BP5 md.0 carries no header in this format version
 
     m_Comm.Barrier();
+    openPhase("barrier2");
     StartDrainThreads();
+    openPhase("threads-started");
 
     if (m_Parameters.verbose > 0)
     {
@@ -1301,6 +1321,18 @@ void BbviewWriter::DoClose(const int /*transportIndex*/)
         return;
     }
 
+    // TEMPORARY: close-phase profiling; see the matching block in
+    // InitTransports. Remove after diagnosis.
+    const auto tCloseStart = std::chrono::steady_clock::now();
+    const auto closePhase = [this, tCloseStart](const char *phase) {
+        const double ms = std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - tCloseStart)
+                              .count();
+        std::cerr << "bbview rank " << m_RankMPI << " close-phase " << phase << " @"
+                  << static_cast<long long>(ms) << " ms\n";
+        std::cerr.flush();
+    };
+
     std::exception_ptr err;
     try
     {
@@ -1317,8 +1349,10 @@ void BbviewWriter::DoClose(const int /*transportIndex*/)
             }
         }
     }
+    closePhase("drain-commit-all");
 
     StopDrainThreads();
+    closePhase("stop-threads");
 
     if (!err)
     {
@@ -1338,6 +1372,7 @@ void BbviewWriter::DoClose(const int /*transportIndex*/)
             err = std::current_exception();
         }
     }
+    closePhase("inactive-flag");
 
     if (m_DataFd >= 0)
     {
@@ -1361,6 +1396,7 @@ void BbviewWriter::DoClose(const int /*transportIndex*/)
     {
         m_MDIndexFile->Close();
     }
+    closePhase("close-files");
 
     // drain progress markers are only meaningful while the writer lives
     std::error_code ec;
@@ -1373,6 +1409,7 @@ void BbviewWriter::DoClose(const int /*transportIndex*/)
     {
         std::filesystem::remove(m_StagingDir, ec); // succeeds only if empty
     }
+    closePhase("marker-cleanup");
 
     m_IsOpen = false;
 
