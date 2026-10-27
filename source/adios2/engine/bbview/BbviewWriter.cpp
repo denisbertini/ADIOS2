@@ -228,6 +228,27 @@ void BbviewWriter::InitParameters()
     {
         m_DeleteStagedFiles = (s == "true" || s == "on" || s == "1");
     }
+    if (helper::GetParameter(lower, "closemode", s))
+    {
+        if (s == "staged" || s == "async" || s == "stage")
+        {
+            m_CloseModeStaged = true;
+        }
+        else if (s == "durable" || s == "default")
+        {
+            m_CloseModeStaged = false;
+        }
+        else
+        {
+            helper::Throw<std::invalid_argument>("Engine", "BbviewWriter", "InitParameters",
+                                                 "CloseMode must be 'durable' or 'staged', got '" +
+                                                     s + "'");
+        }
+    }
+    if (helper::GetParameter(lower, "stagingwatermarkmb", u))
+    {
+        m_StagingWatermarkBytes = u * 1024ULL * 1024ULL;
+    }
 }
 
 void BbviewWriter::InitTransports()
@@ -294,6 +315,20 @@ void BbviewWriter::InitTransports()
     // that multiple ranks sharing a node never clobber each other's steps
     m_StagingDir = m_BurstBufferPath + "/bbview-" + SanitizeForPath(m_Name);
     std::error_code ec;
+    // remove stale staging files left by a crashed previous run of the same
+    // name: the staging dir is a node-local cache, and leftovers would
+    // accumulate and block the end-of-run directory removal
+    if (std::filesystem::exists(m_StagingDir, ec))
+    {
+        for (auto it = std::filesystem::directory_iterator(m_StagingDir, ec);
+             !ec && it != std::filesystem::directory_iterator{}; it.increment(ec))
+        {
+            if (it->is_regular_file(ec))
+            {
+                std::filesystem::remove(it->path(), ec);
+            }
+        }
+    }
     std::filesystem::create_directories(m_StagingDir, ec);
     if (ec)
     {
@@ -323,13 +358,23 @@ void BbviewWriter::InitTransports()
 
     m_Comm.Barrier();
     openPhase("barrier2");
-    StartDrainThreads();
+    if (m_CloseModeStaged)
+    {
+        // staged close: no per-instance drain workers; the process-level
+        // finalizer takes the session over at Close() and does the draining
+        BbviewStagedFinalizer::Instance().SetStagingWatermark(m_StagingWatermarkBytes);
+    }
+    else
+    {
+        StartDrainThreads();
+    }
     openPhase("threads-started");
 
     if (m_Parameters.verbose > 0)
     {
         std::cout << "bbview rank " << m_RankMPI << " opened stream " << m_Name
-                  << " staging=" << m_StagingDir << " drainThreads=" << m_DrainThreads << "\n";
+                  << " staging=" << m_StagingDir << " drainThreads=" << m_DrainThreads
+                  << " closeMode=" << (m_CloseModeStaged ? "staged" : "durable") << "\n";
     }
 }
 
@@ -343,6 +388,7 @@ StepStatus BbviewWriter::BeginStep(StepMode /*mode*/, const float /*timeoutSecon
                                         "BeginStep() called twice without EndStep()");
     }
     CheckDrainError();
+    BbviewStagedFinalizer::Instance().CheckError(); // staged mode: earlier sessions
     m_BetweenStepPairs = true;
 
     if (m_IsFirstStep && m_Parameters.UseOneTimeAttributes)
@@ -378,6 +424,7 @@ void BbviewWriter::PerformPuts() { m_BP5Serializer.PerformPuts(false); }
 void BbviewWriter::EndStep()
 {
     CheckDrainError();
+    BbviewStagedFinalizer::Instance().CheckError(); // staged mode: earlier sessions
     m_BetweenStepPairs = false;
 
     MarshalAttributes();
@@ -392,6 +439,15 @@ void BbviewWriter::EndStep()
     if (m_Parameters.StripeSize > 1)
     {
         finalPos += helper::PaddingToAlignOffset(finalPos, m_Parameters.StripeSize);
+    }
+
+    // staged close: backpressure. If the application stages faster than the
+    // background drain keeps up, block here so the node-local burst buffer
+    // cannot fill. (Durable mode needs no such guard: the instance's own
+    // drain workers run concurrently and Close() waits for them anyway.)
+    if (m_CloseModeStaged)
+    {
+        BbviewStagedFinalizer::Instance().AccountStaged(dataSize);
     }
 
     // Synchronous spill of the step payload to node-local SSD: the bbview
@@ -441,6 +497,13 @@ void BbviewWriter::EndStep()
 
 void BbviewWriter::Flush(const int /*transportIndex*/)
 {
+    if (m_CloseModeStaged)
+    {
+        helper::Throw<std::logic_error>("Engine", "BbviewWriter", "Flush",
+                                        "Flush() is not supported in staged close mode: data "
+                                        "is staged at EndStep() and finalized in the background "
+                                        "after Close()");
+    }
     if (m_BetweenStepPairs)
     {
         helper::Throw<std::logic_error>("Engine", "BbviewWriter", "Flush",
@@ -751,7 +814,7 @@ void BbviewWriter::WaitForAllRanksDrained(size_t step)
                 }
             }
             DrainProgress p;
-            if (ReadProgress(path, p) && p.DrainedSteps >= step + 1)
+            if (BbviewReadProgress(path, p) && p.DrainedSteps >= step + 1)
             {
                 break;
             }
@@ -772,7 +835,7 @@ void BbviewWriter::WaitForAllRanksDrained(size_t step)
                                                   "timeout waiting for drain of step " +
                                                       std::to_string(step) + " on rank " +
                                                       std::to_string(r) + " (progress: " +
-                                                      (ReadProgress(path, p)
+                                                      (BbviewReadProgress(path, p)
                                                            ? std::to_string(p.DrainedSteps) + " steps"
                                                            : std::string("no progress file")) +
                                                       ")");
@@ -797,59 +860,8 @@ void BbviewWriter::WriteProgress(uint64_t drainedSteps, uint64_t drainedBytes)
                        std::to_string(m_RankMPI) + ", host " + m_Host + ")");
         }
     }
-    DrainProgress p;
-    p.Rank = static_cast<uint64_t>(m_RankMPI);
-    p.DrainedSteps = drainedSteps;
-    p.DrainedBytes = drainedBytes;
-    p.Seq = ++m_ProgressSeq;
-    p.SeqCopy = p.Seq;
-
-    // single fixed-offset pwrite of the whole record: no tmp file, no rename
-    const char *ptr = reinterpret_cast<const char *>(&p);
-    size_t off = 0;
-    size_t left = sizeof(p);
-    while (left > 0)
-    {
-        const ssize_t w = pwrite(m_ProgressFd, ptr, left, static_cast<off_t>(off));
-        if (w < 0)
-        {
-            if (errno == EINTR)
-            {
-                continue;
-            }
-            ThrowPosix("write progress " + m_ProgressPath + " (rank " +
-                       std::to_string(m_RankMPI) + ", host " + m_Host + ")");
-        }
-        ptr += w;
-        off += static_cast<uint64_t>(w);
-        left -= static_cast<size_t>(w);
-    }
-}
-
-bool BbviewWriter::ReadProgress(const std::string &path, DrainProgress &out)
-{
-    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0)
-    {
-        return false;
-    }
-    char buf[sizeof(DrainProgress)];
-    size_t got = 0;
-    while (got < sizeof(buf))
-    {
-        const ssize_t n = read(fd, buf + got, sizeof(buf) - got);
-        if (n <= 0)
-        {
-            close(fd);
-            return false; // not (fully) written yet
-        }
-        got += static_cast<size_t>(n);
-    }
-    close(fd);
-    std::memcpy(&out, buf, sizeof(buf));
-    // seqlock validation: disagreeing sequence numbers mean the record was
-    // caught mid-update; the caller polls and will retry
-    return out.Magic == DrainMagicValue && out.Version == 1 && out.Seq == out.SeqCopy;
+    BbviewWriteProgressRecord(m_ProgressFd, m_ProgressPath, static_cast<uint64_t>(m_RankMPI),
+                              drainedSteps, drainedBytes, m_ProgressSeq, m_Host);
 }
 
 void BbviewWriter::CheckDrainError()
@@ -1342,6 +1354,60 @@ void BbviewWriter::DoClose(const int /*transportIndex*/)
                   << static_cast<long long>(ms) << " ms\n";
         std::cerr.flush();
     };
+
+    if (m_CloseModeStaged)
+    {
+        // Staged close: the application-visible checkpoint cost ends here.
+        // The session (undrained staging files, data sub-file fd, metadata
+        // transports, commit queue) is handed to the process-level finalizer,
+        // which drains to the final store and commits the metadata in the
+        // background while the application computes. The finalizer's
+        // destructor (clean process exit) is the durability barrier; a crash
+        // loses the sessions that were not finalized yet (no bbview.final
+        // marker).
+        BbviewStagedFinalizer::Instance().CheckError();
+
+        BbviewStagedFinalizer::Session session;
+        session.FinalDir = m_Name;
+        session.DataFileName = m_DataFileName;
+        session.StagingDir = m_StagingDir;
+        session.ProgressPath = m_ProgressPath;
+        session.Host = m_Host;
+        session.Rank = m_RankMPI;
+        session.WriterCount = m_Comm.Size();
+        session.Verbose = m_Parameters.verbose;
+        session.DataFd = m_DataFd;
+        m_DataFd = -1;
+        session.ProgressFd = m_ProgressFd;
+        m_ProgressFd = -1;
+        session.ProgressSeq = m_ProgressSeq;
+        session.MDFile = std::move(m_MDFile);
+        session.MMDFile = std::move(m_MMDFile);
+        session.MDIndexFile = std::move(m_MDIndexFile);
+        {
+            std::lock_guard<std::mutex> lck(m_Mutex);
+            session.DataQueue = std::move(m_DataQueue);
+            session.CommitQueue = std::move(m_CommitQueue);
+            session.NextDataSeq = m_NextDataSeq;
+            session.DrainedWatermark = m_DrainedWatermark;
+            session.PublishedSteps = m_PublishedSteps;
+            session.ProgressBytes = m_ProgressBytes;
+            session.DoneDataSeqs = std::move(m_DoneDataSeqs);
+            session.CommitEnqueued = m_CommitEnqueued;
+            session.CommitDone = m_CommitDone;
+        }
+        session.DrainDataSync = m_DrainDataSync;
+        session.DeleteStagedFiles = m_DeleteStagedFiles;
+        session.CommitPollMs = m_CommitPollMs;
+        session.CommitTimeoutSecs = m_CommitTimeoutSecs;
+        BbviewStagedFinalizer::Instance().RegisterSession(std::move(session));
+        m_StagingDir.clear(); // owned by the finalizer now
+        closePhase("staged-handoff");
+        m_Comm.Barrier();
+        closePhase("staged-barrier");
+        m_IsOpen = false;
+        return;
+    }
 
     std::exception_ptr err;
     try

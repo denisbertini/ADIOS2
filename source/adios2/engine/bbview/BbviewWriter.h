@@ -9,6 +9,8 @@
 
 #include "adios2/common/ADIOSConfig.h"
 #include "adios2/core/Engine.h"
+#include "adios2/engine/bbview/BbviewDrainCommon.h"
+#include "adios2/engine/bbview/BbviewStagedFinalizer.h"
 #include "adios2/engine/bp5/BP5Engine.h"
 #include "adios2/toolkit/format/bp5/BP5Serializer.h"
 #include "adios2/toolkit/transport/Transport.h"
@@ -89,6 +91,21 @@ namespace engine
  *                       waiting for slow/dead peers (default 300, 0 = wait
  *                       forever)
  *   DeleteStagedFiles   remove staging files once drained (default true)
+ *   CloseMode           "durable" (default) or "staged". Staged: Close()
+ *                       returns as soon as the last step is written to the
+ *                       node-local burst buffer; the drain and the metadata
+ *                       commit then run in the process background
+ *                       (BbviewStagedFinalizer) while the application
+ *                       computes. A clean process exit finalizes every
+ *                       pending session before the process ends; a crash
+ *                       loses the checkpoints that were staged but not yet
+ *                       finalized. Finalization publishes
+ *                       <finalDir>/bbview.final, the durability/visibility
+ *                       marker for readers and restart policies.
+ *   StagingWatermarkMB  staged mode: per-rank cap on staged-but-undrained
+ *                       bytes; EndStep() blocks above it so the node-local
+ *                       burst buffer cannot fill (default 1024, 0 =
+ *                       unlimited)
  */
 class BbviewWriter : public BP5Engine, public core::Engine
 {
@@ -105,44 +122,9 @@ public:
     void NotifyEngineAttribute(std::string name, AttributeBase *Attr, void *data) noexcept final;
 
 private:
-    /** One unit of deferred work handed to the in-process "bbviewd" threads.
-     * Data jobs: copy staging file -> final data file at FinalPos.
-     * Commit jobs (rank 0 only): append per-step metadata once the step is
-     * drained on every writer rank. */
-    struct DrainJob
-    {
-        size_t Seq = 0; // data job sequence number (one data job per step)
-        size_t Step = 0;
-        bool IsCommit = false;
-        // data job:
-        std::string StagingPath;
-        uint64_t FinalPos = 0; // offset of the step in the final data sub-file
-        size_t DataSize = 0;
-        // commit job (rank 0):
-        std::vector<char> MMDBytes; // meta-metadata records for mmd.0
-        std::vector<char> MDRecord; // one md.0 step record
-        std::vector<char> IdxRecord; // one md.idx step record
-    };
-
-    /** Fixed-size drain progress record, the in-process replacement for
-     * bbview's out-of-band xattr handoff. Published by each writer rank with
-     * a single pwrite at offset 0 of a pre-created file in the output
-     * directory, guarded by a sequence lock (Seq/SeqCopy). tmp+rename was
-     * avoided on purpose: on network/FUSE final stores a rename of a
-     * just-created tmp file can transiently fail with ENOENT due to stale
-     * lookups. Readers reject records whose sequence numbers disagree;
-     * tearing can therefore only make progress look older, never newer. */
-    struct DrainProgress
-    {
-        uint64_t Magic = DrainMagicValue;
-        uint64_t Version = 1;
-        uint64_t Rank = 0;
-        uint64_t Seq = 0;          // incremented on every publish
-        uint64_t DrainedSteps = 0; // number of leading steps fully drained
-        uint64_t DrainedBytes = 0;
-        uint64_t SeqCopy = 0; // must equal Seq for a stable record
-    };
-    static constexpr uint64_t DrainMagicValue = 0x42425644ULL; // "BBVD"
+    // drain protocol types shared with the staged-close finalizer
+    using DrainJob = BbviewDrainJob;
+    using DrainProgress = BbviewDrainProgress;
 
     // engine lifecycle
     void Init() final;
@@ -167,7 +149,6 @@ private:
     void RunCommitJob(const DrainJob &job);
     void WaitForAllRanksDrained(size_t step);
     void WriteProgress(uint64_t drainedSteps, uint64_t drainedBytes);
-    static bool ReadProgress(const std::string &path, DrainProgress &out);
     void CheckDrainError();
     void DrainAndCommitAll();
 
@@ -185,6 +166,8 @@ private:
     unsigned int m_CommitPollMs = 2;
     float m_CommitTimeoutSecs = 300.f;
     bool m_DeleteStagedFiles = true;
+    bool m_CloseModeStaged = false;                 // CloseMode=staged
+    uint64_t m_StagingWatermarkBytes = 1024ULL << 20; // StagingWatermarkMB (0 = unlimited)
 
     format::BP5Serializer m_BP5Serializer;
 

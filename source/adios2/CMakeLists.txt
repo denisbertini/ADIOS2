@@ -341,6 +341,8 @@ if(NOT WIN32)
   # bbview: daemonless view-aware burst buffer engine (POSIX-only staging)
   target_sources(adios2_core PRIVATE
     engine/bbview/BbviewWriter.cpp
+    engine/bbview/BbviewDrainCommon.cpp
+    engine/bbview/BbviewStagedFinalizer.cpp
   )
   target_compile_definitions(adios2_core PRIVATE ADIOS2_HAVE_BBVIEW)
 endif()
