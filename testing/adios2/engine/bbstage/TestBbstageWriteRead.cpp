@@ -19,8 +19,8 @@
 namespace
 {
 
-const std::string TestName = "BbviewTest.bp";
-const std::string StagingDir = "bbview-staging-test";
+const std::string TestName = "BbstageTest.bp";
+const std::string StagingDir = "bbstage-staging-test";
 
 std::vector<float> MakeStep(size_t step, size_t n)
 {
@@ -65,11 +65,11 @@ int MpiSize()
 #endif
 }
 
-class EngineBbview : public ::testing::Test
+class EngineBbstage : public ::testing::Test
 {
 public:
-    EngineBbview() = default;
-    ~EngineBbview() override {}
+    EngineBbstage() = default;
+    ~EngineBbstage() override {}
 
 protected:
     void SetUp() override
@@ -98,10 +98,10 @@ protected:
 
 } // end anonymous namespace
 
-// Write with the bbview engine (steps land on the node-local staging tier and
+// Write with the bbstage engine (steps land on the node-local staging tier and
 // drain in the background), close drains everything, then read back with the
 // standard bp5 engine to prove full output compatibility.
-TEST_F(EngineBbview, WriteDrainReadBackBP5)
+TEST_F(EngineBbstage, WriteDrainReadBackBP5)
 {
     constexpr size_t n = 100;
     constexpr int nSteps = 3;
@@ -110,14 +110,14 @@ TEST_F(EngineBbview, WriteDrainReadBackBP5)
     const size_t globalN = n * static_cast<size_t>(size);
 
     {
-        adios2::IO io = m_Adios.DeclareIO("bbview-writer");
-        io.SetEngine("bbview");
+        adios2::IO io = m_Adios.DeclareIO("bbstage-writer");
+        io.SetEngine("bbstage");
         io.SetParameters({{"BurstBufferPath", StagingDir}, {"verbose", "0"}});
 
         // each rank owns a disjoint block of the global array
         auto gvar = io.DefineVariable<float>("gdata", {globalN},
                                              {static_cast<size_t>(rank) * n}, {n});
-        io.DefineAttribute<std::string>("written_by", "bbview-engine");
+        io.DefineAttribute<std::string>("written_by", "bbstage-engine");
 
         adios2::Engine engine = io.Open(TestName, adios2::Mode::Write);
         for (int s = 0; s < nSteps; ++s)
@@ -140,7 +140,7 @@ TEST_F(EngineBbview, WriteDrainReadBackBP5)
         ASSERT_TRUE(std::filesystem::exists(mdidx));
         for (const auto &e : std::filesystem::directory_iterator(TestName))
         {
-            EXPECT_EQ(std::string(e.path().filename()).rfind("bbview.drain.", 0),
+            EXPECT_EQ(std::string(e.path().filename()).rfind("bbstage.drain.", 0),
                       std::string::npos)
                 << "stale drain progress file left behind: " << e.path();
         }
@@ -163,7 +163,7 @@ TEST_F(EngineBbview, WriteDrainReadBackBP5)
         ASSERT_TRUE(static_cast<bool>(gvar));
         auto attr = io.InquireAttribute<std::string>("written_by");
         ASSERT_TRUE(static_cast<bool>(attr));
-        EXPECT_EQ(attr.Data()[0], "bbview-engine");
+        EXPECT_EQ(attr.Data()[0], "bbstage-engine");
 
         for (size_t s = 0; s < static_cast<size_t>(nSteps); ++s)
         {
@@ -177,10 +177,10 @@ TEST_F(EngineBbview, WriteDrainReadBackBP5)
         reader.Close();
     }
 
-    // and with engine "bbview" in read mode (registers the BP5 reader)
+    // and with engine "bbstage" in read mode (registers the BP5 reader)
     {
-        adios2::IO io = m_Adios.DeclareIO("bbview-reader");
-        io.SetEngine("bbview");
+        adios2::IO io = m_Adios.DeclareIO("bbstage-reader");
+        io.SetEngine("bbstage");
         adios2::Engine reader = io.Open(TestName, adios2::Mode::ReadRandomAccess);
         EXPECT_EQ(reader.Steps(), static_cast<size_t>(nSteps));
         reader.Close();
@@ -190,7 +190,7 @@ TEST_F(EngineBbview, WriteDrainReadBackBP5)
 // Streaming read: the engine only commits metadata after the step data has
 // drained from the burst buffer to the final store, so every step a streaming
 // reader observes is complete.
-TEST_F(EngineBbview, StreamingReadSeesOnlyDrainedSteps)
+TEST_F(EngineBbstage, StreamingReadSeesOnlyDrainedSteps)
 {
     constexpr size_t n = 50;
     constexpr int nSteps = 4;
@@ -198,15 +198,15 @@ TEST_F(EngineBbview, StreamingReadSeesOnlyDrainedSteps)
     const int size = MpiSize();
     const size_t globalN = n * static_cast<size_t>(size);
 
-    adios2::IO wio = m_Adios.DeclareIO("bbview-stream-writer");
-    wio.SetEngine("bbview");
+    adios2::IO wio = m_Adios.DeclareIO("bbstage-stream-writer");
+    wio.SetEngine("bbstage");
     wio.SetParameters({{"BurstBufferPath", StagingDir}});
     auto wvar = wio.DefineVariable<float>("gdata", {globalN},
                                           {static_cast<size_t>(rank) * n}, {n});
 
     adios2::Engine writer = wio.Open(TestName, adios2::Mode::Write);
 
-    adios2::IO rio = m_Adios.DeclareIO("bbview-stream-reader");
+    adios2::IO rio = m_Adios.DeclareIO("bbstage-stream-reader");
     rio.SetEngine("bp5");
     rio.SetParameters({{"OpenTimeoutSecs", "60"}, {"BeginStepPollingFrequencySecs", "0.05"}});
     adios2::Engine reader = rio.Open(TestName, adios2::Mode::Read);

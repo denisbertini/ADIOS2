@@ -17,7 +17,7 @@ Parameters are passed at:
 3. :ref:`Runtime Configuration Files` in the :ref:`ADIOS` component.
 
 .. include:: bp5.rst
-.. include:: bbview.rst
+.. include:: bbstage.rst
 .. include:: bp4.rst
 .. include:: bp3.rst
 .. include:: hdf5.rst

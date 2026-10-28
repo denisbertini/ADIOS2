@@ -1,14 +1,16 @@
 *************
-bbview Engine
+bbstage Engine
 *************
 
 .. versionadded:: 2.12
 
-The **bbview** engine is a daemonless *view-aware burst buffer* transport for
-ADIOS2. It ports the mechanism of `BBView: A View-Aware Burst-Buffer Mechanism
-for MPI-IO <https://github.com/tsukuba-hpcs/bbview>`_ (Koyama & Tatebe, REX-IO
-2025) from an Open MPI ompio component plus an external ``bbviewd`` daemon to
-a pure in-process ADIOS2 engine: **no daemon service is required on any node**.
+The **bbstage** engine is a write-only BP5 engine with node-local
+burst-buffer staging and asynchronous drain: **no daemon service is required
+on any node**. The staging + background-drain approach follows `BBView: A
+View-Aware Burst-Buffer Mechanism for MPI-IO <https://github.com/tsukuba-hpcs/bbview>`_
+(Koyama & Tatebe, REX-IO 2025); unlike BBView there is no daemon and no view
+transformation -- the staged payload is already serialized in final BP5
+layout, so the background work is a byte copy plus a deferred metadata commit.
 
 Idea
 ----
@@ -18,7 +20,7 @@ cheap local layout while the expensive placement work is *deferred* and
 replayed in a single sequential pass by a background agent (in BBView: the MPI
 file view, staged out by ``bbviewd`` onto the parallel filesystem).
 
-The ADIOS2 engine keeps this contract and removes the daemon:
+The engine implements this contract fully in-process:
 
 * ``EndStep()`` serializes the step in memory and writes the payload
   **synchronously to a per-rank staging file on node-local SSD**
@@ -34,7 +36,7 @@ The ADIOS2 engine keeps this contract and removes the daemon:
   (``md.0`` / ``md.idx`` / ``mmd.0``) only after **every** writer rank has
   drained that step's data. The metadata commit is the visibility point.
   Ranks publish their drain progress through a small per-rank record file
-  (``bbview.drain.<rank>``) in the output directory, updated with fixed-size
+  (``bbstage.drain.<rank>``) in the output directory, updated with fixed-size
   sequence-locked writes (no renames), so the coordination also works on
   network/FUSE mounts that cache directory lookups.
 * Consequences:
@@ -43,8 +45,16 @@ The ADIOS2 engine keeps this contract and removes the daemon:
     ``bp5`` engine -- both after ``Close()`` and, for streaming readers, step
     by step as steps commit. A reader can never observe a step whose data has
     not landed on the final store.
-  - ``Flush()`` and ``Close()`` are the durability points: they block until
-    all steps drained and committed.
+  - In ``durable`` mode (default), ``Flush()`` and ``Close()`` are the
+    durability points: they block until all steps are drained and committed.
+  - In ``staged`` mode (``CloseMode=staged``), ``Close()`` returns as soon as
+    the last step has reached the node-local tier; the drain and the metadata
+    commit then run in the process background while the application computes.
+    A clean process exit finalizes every pending session before the process
+    ends; a crash loses checkpoints that were staged but not yet finalized.
+    Finalization publishes ``<checkpoint-dir>/bbstage.final`` -- the
+    durability/visibility marker that readers and restart policies should key
+    on. Never delete a staged checkpoint before that marker exists.
   - Unlike BBView's fire-and-forget flush, **drain errors are reported** to
     the application at the next ``EndStep()`` / ``Flush()`` / ``Close()``, and
     the committer gives up (with an explicit error naming the stuck rank)
@@ -53,23 +63,23 @@ The ADIOS2 engine keeps this contract and removes the daemon:
 Engine name and read side
 -------------------------
 
-Use ``io.SetEngine("bbview")``. In write mode this activates the burst-buffer
+Use ``io.SetEngine("bbstage")``. In write mode this activates the burst-buffer
 writer. In read mode the engine maps to the standard BP5 reader, since the
 staged-and-drained output is ordinary BP5::
 
     adios2::IO io = adios.DeclareIO("bb");
-    io.SetEngine("bbview");
+    io.SetEngine("bbstage");
     io.SetParameters({{"BurstBufferPath", "/scratch/local"}});
     adios2::Engine engine = io.Open("out.bp", adios2::Mode::Write);
     for (...) { engine.BeginStep(); engine.Put(var, data); engine.EndStep(); }
     engine.Close();   // drains the burst buffer
 
-Readers may simply use ``bp5`` (or ``bbview``), streaming or random access.
+Readers may simply use ``bp5`` (or ``bbstage``), streaming or random access.
 
 Engine parameters
 -----------------
 
-bbview-specific parameters:
+bbstage-specific parameters:
 
 +--------------------+---------+-----------------------------------------------+
 | Parameter          | Default | Description                                   |
@@ -90,6 +100,16 @@ bbview-specific parameters:
 |                    |         | before failing the stream (0 = forever)       |
 +--------------------+---------+-----------------------------------------------+
 | DeleteStagedFiles  | true    | Remove staging files once drained             |
++--------------------+---------+-----------------------------------------------+
+| CloseMode          | durable | ``durable`` (default): ``Close()`` waits for  |
+|                    |         | drain + commit. ``staged``: ``Close()``       |
+|                    |         | returns at the node-local dump; drain +       |
+|                    |         | commit run in the background, finalized at a  |
+|                    |         | clean exit (see above)                        |
++--------------------+---------+-----------------------------------------------+
+| StagingWatermarkMB | 1024    | staged mode: per-rank cap on staged-but-      |
+|                    |         | undrained bytes (MiB); ``EndStep`` blocks     |
+|                    |         | above it (0 = unlimited)                      |
 +--------------------+---------+-----------------------------------------------+
 
 Shared BP5 parameters are honored where they apply:

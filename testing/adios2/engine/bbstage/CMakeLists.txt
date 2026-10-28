@@ -8,19 +8,19 @@
 #------------------------------------------------------------------------------#
 
 if(NOT WIN32)
-  add_executable(Test.Engine.Bbview.WriteRead TestBbviewWriteRead.cpp)
+  add_executable(Test.Engine.Bbstage.WriteRead TestBbstageWriteRead.cpp)
 
   if(ADIOS2_HAVE_MPI)
-    target_link_libraries(Test.Engine.Bbview.WriteRead adios2::thirdparty::gtest
+    target_link_libraries(Test.Engine.Bbstage.WriteRead adios2::thirdparty::gtest
       adios2::cxx_mpi adios2_core_mpi MPI::MPI_CXX)
     set(cmd_executor
       ${MPIEXEC_EXECUTABLE} ${MPIEXEC_EXTRA_FLAGS} ${MPIEXEC_NUMPROC_FLAG} 2)
   else()
-    target_link_libraries(Test.Engine.Bbview.WriteRead adios2::thirdparty::gtest
+    target_link_libraries(Test.Engine.Bbstage.WriteRead adios2::thirdparty::gtest
       adios2::cxx adios2_core)
     set(cmd_executor)
   endif()
 
-  add_test(NAME Engine.Bbview.WriteRead
-    COMMAND ${cmd_executor} $<TARGET_FILE:Test.Engine.Bbview.WriteRead>)
+  add_test(NAME Engine.Bbstage.WriteRead
+    COMMAND ${cmd_executor} $<TARGET_FILE:Test.Engine.Bbstage.WriteRead>)
 endif()
