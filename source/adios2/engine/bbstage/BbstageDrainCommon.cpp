@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "BbviewDrainCommon.h"
+#include "BbstageDrainCommon.h"
 
 #include <cerrno>
 #include <cstring>
@@ -20,14 +20,14 @@ namespace core
 namespace engine
 {
 
-bool BbviewReadProgress(const std::string &path, BbviewDrainProgress &out)
+bool BbstageReadProgress(const std::string &path, BbstageDrainProgress &out)
 {
     const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0)
     {
         return false;
     }
-    char buf[sizeof(BbviewDrainProgress)];
+    char buf[sizeof(BbstageDrainProgress)];
     size_t got = 0;
     while (got < sizeof(buf))
     {
@@ -43,14 +43,14 @@ bool BbviewReadProgress(const std::string &path, BbviewDrainProgress &out)
     std::memcpy(&out, buf, sizeof(buf));
     // seqlock validation: disagreeing sequence numbers mean the record was
     // caught mid-update; the caller polls and will retry
-    return out.Magic == BbviewDrainMagicValue && out.Version == 1 && out.Seq == out.SeqCopy;
+    return out.Magic == BbstageDrainMagicValue && out.Version == 1 && out.Seq == out.SeqCopy;
 }
 
-void BbviewWriteProgressRecord(int fd, const std::string &path, uint64_t rank,
+void BbstageWriteProgressRecord(int fd, const std::string &path, uint64_t rank,
                                uint64_t drainedSteps, uint64_t drainedBytes,
                                uint64_t &seq, const std::string &host)
 {
-    BbviewDrainProgress p;
+    BbstageDrainProgress p;
     p.Rank = rank;
     p.DrainedSteps = drainedSteps;
     p.DrainedBytes = drainedBytes;
@@ -70,7 +70,7 @@ void BbviewWriteProgressRecord(int fd, const std::string &path, uint64_t rank,
             {
                 continue;
             }
-            throw std::runtime_error("bbview: write progress " + path + " (rank " +
+            throw std::runtime_error("bbstage: write progress " + path + " (rank " +
                                      std::to_string(rank) + ", host " + host + "): " +
                                      std::strerror(errno));
         }

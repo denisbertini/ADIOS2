@@ -24,8 +24,8 @@
 #include "adios2/engine/bp4/BP4Writer.h"
 #include "adios2/engine/bp5/BP5Reader.h"
 #include "adios2/engine/bp5/BP5Writer.h"
-#ifdef ADIOS2_HAVE_BBVIEW
-#include "adios2/engine/bbview/BbviewWriter.h"
+#ifdef ADIOS2_HAVE_BBSTAGE
+#include "adios2/engine/bbstage/BbstageWriter.h"
 #endif
 #include "adios2/engine/inline/InlineReader.h"
 #include "adios2/engine/inline/InlineWriter.h"
@@ -94,15 +94,15 @@ std::unordered_map<std::string, IO::EngineFactoryEntry> Factory = {
                        "DataMan library, can't use DataMan engine\n")
 #endif
     },
-    {"bbview",
-#ifdef ADIOS2_HAVE_BBVIEW
-     // read side is the standard BP5 reader: bbview writes standard BP5
+    {"bbstage",
+#ifdef ADIOS2_HAVE_BBSTAGE
+     // read side is the standard BP5 reader: bbstage writes standard BP5
      // files, with per-step metadata committed only once the step's data
      // has drained from the node-local burst buffer to the final store
-     {IO::MakeEngine<engine::BP5Reader>, IO::MakeEngine<engine::BbviewWriter>}
+     {IO::MakeEngine<engine::BP5Reader>, IO::MakeEngine<engine::BbstageWriter>}
 #else
      IO::NoEngineEntry("ERROR: this version didn't compile with "
-                       "the bbview engine (POSIX only)\n")
+                       "the bbstage engine (POSIX only)\n")
 #endif
     },
     {"ssc", IO::NoEngineEntry("ERROR: this version didn't compile with "
@@ -172,7 +172,7 @@ std::unordered_map<std::string, IO::EngineFactoryEntry> Factory = {
 };
 
 const std::unordered_map<std::string, bool> ReadRandomAccess_Supported = {
-    {"bp3", false},     {"bp4", false},        {"bp5", true},      {"bbview", true},
+    {"bp3", false},     {"bp4", false},        {"bp5", true},      {"bbstage", true},
     {"dataman", false}, {"ssc", false},        {"mhs", false},     {"sst", false},
     {"daos", false},    {"effis", false},      {"dataspaces", false},
     {"hdf5", false},    {"skeleton", true},    {"inline", false},  {"null", true},

@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "BbviewWriter.h"
+#include "BbstageWriter.h"
 
 #include "adios2/common/ADIOSMacros.h"
 #include "adios2/core/IO.h"
@@ -43,10 +43,11 @@ namespace engine
 
 namespace
 {
-constexpr size_t DrainCopyBufferSize = 4 * 1024 * 1024; // like bbviewd's replay buffer
+constexpr size_t DrainCopyBufferSize = 4 * 1024 * 1024; // cf. bbviewd's replay buffer
 
-// bbview flattened "path-<rank>-<view_index>" staging names, hardened: cap the
-// length and mix in a hash to avoid PATH_MAX issues and collisions.
+// Staging file names (cf. the original bbview's flattened
+// "path-<rank>-<view_index>" scheme), hardened: cap the length and mix in a
+// hash to avoid PATH_MAX issues and collisions.
 std::string SanitizeForPath(const std::string &name)
 {
     std::string out;
@@ -68,7 +69,7 @@ std::string SanitizeForPath(const std::string &name)
 
 [[noreturn]] void ThrowPosix(const std::string &what)
 {
-    helper::Throw<std::runtime_error>("Engine", "BbviewWriter", what,
+    helper::Throw<std::runtime_error>("Engine", "BbstageWriter", what,
                                       what + ": " + std::string(std::strerror(errno)));
     std::abort(); // helper::Throw always throws; keep the noreturn contract explicit
 }
@@ -119,15 +120,15 @@ void PwriteBuffer(int fd, const char *buf, size_t size, uint64_t offset)
 }
 } // end anonymous namespace
 
-BbviewWriter::BbviewWriter(IO &io, const std::string &name, const Mode mode, helper::Comm comm)
-: Engine("BbviewWriter", io, name, mode, std::move(comm))
+BbstageWriter::BbstageWriter(IO &io, const std::string &name, const Mode mode, helper::Comm comm)
+: Engine("BbstageWriter", io, name, mode, std::move(comm))
 {
     m_IO.m_ReadStreaming = false;
     Init();
     m_IsOpen = true;
 }
 
-BbviewWriter::~BbviewWriter()
+BbstageWriter::~BbstageWriter()
 {
     if (m_IsOpen)
     {
@@ -138,15 +139,15 @@ BbviewWriter::~BbviewWriter()
 
 // PRIVATE --------------------------------------------------------------------
 
-void BbviewWriter::Init()
+void BbstageWriter::Init()
 {
     InitParameters();
     m_RankMPI = m_Comm.Rank();
 
     if (m_OpenMode != Mode::Write)
     {
-        helper::Throw<std::invalid_argument>("Engine", "BbviewWriter", "Init",
-                                             "the bbview engine supports write mode only "
+        helper::Throw<std::invalid_argument>("Engine", "BbstageWriter", "Init",
+                                             "the bbstage engine supports write mode only "
                                              "(Append and Read are not implemented; read "
                                              "output with the bp5 engine)");
     }
@@ -158,7 +159,7 @@ void BbviewWriter::Init()
     {
         if (m_Parameters.verbose > 0)
         {
-            std::cout << "bbview engine: DirectIO is not yet supported, parameter ignored\n";
+            std::cout << "bbstage engine: DirectIO is not yet supported, parameter ignored\n";
         }
     }
 
@@ -182,11 +183,11 @@ void BbviewWriter::Init()
     InitTransports();
 }
 
-void BbviewWriter::InitParameters()
+void BbstageWriter::InitParameters()
 {
     ParseParams(m_IO, m_Parameters);
 
-    // bbview-specific parameters (case-insensitive)
+    // bbstage-specific parameters (case-insensitive)
     Params lower;
     for (const auto &kv : m_IO.m_Parameters)
     {
@@ -200,7 +201,7 @@ void BbviewWriter::InitParameters()
     {
         if (u < 1 || u > 16)
         {
-            helper::Throw<std::invalid_argument>("Engine", "BbviewWriter", "InitParameters",
+            helper::Throw<std::invalid_argument>("Engine", "BbstageWriter", "InitParameters",
                                                  "DrainThreads must be in [1,16], got " +
                                                      std::to_string(u));
         }
@@ -240,7 +241,7 @@ void BbviewWriter::InitParameters()
         }
         else
         {
-            helper::Throw<std::invalid_argument>("Engine", "BbviewWriter", "InitParameters",
+            helper::Throw<std::invalid_argument>("Engine", "BbstageWriter", "InitParameters",
                                                  "CloseMode must be 'durable' or 'staged', got '" +
                                                      s + "'");
         }
@@ -251,7 +252,7 @@ void BbviewWriter::InitParameters()
     }
 }
 
-void BbviewWriter::InitTransports()
+void BbstageWriter::InitTransports()
 {
     // TEMPORARY: open-phase profiling to diagnose multi-second Open on the
     // test cluster. One line per rank to stderr; remove after diagnosis.
@@ -260,7 +261,7 @@ void BbviewWriter::InitTransports()
         const double ms = std::chrono::duration<double, std::milli>(
                               std::chrono::steady_clock::now() - tOpenStart)
                               .count();
-        std::cerr << "bbview rank " << m_RankMPI << " open-phase " << phase << " @"
+        std::cerr << "bbstage rank " << m_RankMPI << " open-phase " << phase << " @"
                   << static_cast<long long>(ms) << " ms\n";
         std::cerr.flush();
     };
@@ -313,7 +314,7 @@ void BbviewWriter::InitTransports()
 
     // node-local burst buffer staging directory; file names carry the rank so
     // that multiple ranks sharing a node never clobber each other's steps
-    m_StagingDir = m_BurstBufferPath + "/bbview-" + SanitizeForPath(m_Name);
+    m_StagingDir = m_BurstBufferPath + "/bbstage-" + SanitizeForPath(m_Name);
     std::error_code ec;
     // remove stale staging files left by a crashed previous run of the same
     // name: the staging dir is a node-local cache, and leftovers would
@@ -332,7 +333,7 @@ void BbviewWriter::InitTransports()
     std::filesystem::create_directories(m_StagingDir, ec);
     if (ec)
     {
-        helper::Throw<std::runtime_error>("Engine", "BbviewWriter", "InitTransports",
+        helper::Throw<std::runtime_error>("Engine", "BbstageWriter", "InitTransports",
                                           "cannot create burst buffer staging directory " +
                                               m_StagingDir + ": " + ec.message());
     }
@@ -352,7 +353,7 @@ void BbviewWriter::InitTransports()
     // tail (observed 0.1-2 s on Lustre) dominated Open. The committer treats
     // a missing progress file as "progress 0", which is exactly the initial
     // state, so nothing depends on the file existing after Open.
-    m_ProgressPath = finalDir + "/bbview.drain." + std::to_string(m_RankMPI);
+    m_ProgressPath = finalDir + "/bbstage.drain." + std::to_string(m_RankMPI);
     openPhase("progress-file");
     m_MetaDataPos = 0; // BP5 md.0 carries no header in this format version
 
@@ -362,7 +363,7 @@ void BbviewWriter::InitTransports()
     {
         // staged close: no per-instance drain workers; the process-level
         // finalizer takes the session over at Close() and does the draining
-        BbviewStagedFinalizer::Instance().SetStagingWatermark(m_StagingWatermarkBytes);
+        BbstageStagedFinalizer::Instance().SetStagingWatermark(m_StagingWatermarkBytes);
     }
     else
     {
@@ -372,7 +373,7 @@ void BbviewWriter::InitTransports()
 
     if (m_Parameters.verbose > 0)
     {
-        std::cout << "bbview rank " << m_RankMPI << " opened stream " << m_Name
+        std::cout << "bbstage rank " << m_RankMPI << " opened stream " << m_Name
                   << " staging=" << m_StagingDir << " drainThreads=" << m_DrainThreads
                   << " closeMode=" << (m_CloseModeStaged ? "staged" : "durable") << "\n";
     }
@@ -380,15 +381,15 @@ void BbviewWriter::InitTransports()
 
 /* ---- engine step API ------------------------------------------------------ */
 
-StepStatus BbviewWriter::BeginStep(StepMode /*mode*/, const float /*timeoutSeconds*/)
+StepStatus BbstageWriter::BeginStep(StepMode /*mode*/, const float /*timeoutSeconds*/)
 {
     if (m_BetweenStepPairs)
     {
-        helper::Throw<std::logic_error>("Engine", "BbviewWriter", "BeginStep",
+        helper::Throw<std::logic_error>("Engine", "BbstageWriter", "BeginStep",
                                         "BeginStep() called twice without EndStep()");
     }
     CheckDrainError();
-    BbviewStagedFinalizer::Instance().CheckError(); // staged mode: earlier sessions
+    BbstageStagedFinalizer::Instance().CheckError(); // staged mode: earlier sessions
     m_BetweenStepPairs = true;
 
     if (m_IsFirstStep && m_Parameters.UseOneTimeAttributes)
@@ -405,26 +406,26 @@ StepStatus BbviewWriter::BeginStep(StepMode /*mode*/, const float /*timeoutSecon
     if (m_Parameters.BufferVType == (int)BufferVType::MallocVType)
     {
         m_BP5Serializer.InitStep(new format::MallocV(
-            "BbviewWriter", false, m_BP5Serializer.m_BufferAlign, m_BP5Serializer.m_BufferBlockSize,
+            "BbstageWriter", false, m_BP5Serializer.m_BufferAlign, m_BP5Serializer.m_BufferBlockSize,
             m_Parameters.InitialBufferSize, m_Parameters.GrowthFactor));
     }
     else
     {
-        m_BP5Serializer.InitStep(new format::ChunkV("BbviewWriter", false, m_BP5Serializer.m_BufferAlign,
+        m_BP5Serializer.InitStep(new format::ChunkV("BbstageWriter", false, m_BP5Serializer.m_BufferAlign,
                                             m_BP5Serializer.m_BufferBlockSize,
                                             m_Parameters.BufferChunkSize));
     }
     return StepStatus::OK;
 }
 
-size_t BbviewWriter::CurrentStep() const { return m_WriterStep; }
+size_t BbstageWriter::CurrentStep() const { return m_WriterStep; }
 
-void BbviewWriter::PerformPuts() { m_BP5Serializer.PerformPuts(false); }
+void BbstageWriter::PerformPuts() { m_BP5Serializer.PerformPuts(false); }
 
-void BbviewWriter::EndStep()
+void BbstageWriter::EndStep()
 {
     CheckDrainError();
-    BbviewStagedFinalizer::Instance().CheckError(); // staged mode: earlier sessions
+    BbstageStagedFinalizer::Instance().CheckError(); // staged mode: earlier sessions
     m_BetweenStepPairs = false;
 
     MarshalAttributes();
@@ -447,10 +448,10 @@ void BbviewWriter::EndStep()
     // drain workers run concurrently and Close() waits for them anyway.)
     if (m_CloseModeStaged)
     {
-        BbviewStagedFinalizer::Instance().AccountStaged(dataSize);
+        BbstageStagedFinalizer::Instance().AccountStaged(dataSize);
     }
 
-    // Synchronous spill of the step payload to node-local SSD: the bbview
+    // Synchronous spill of the step payload to node-local SSD: the bbstage
     // critical path. Cheap, contiguous, local; memory is freed immediately.
     const std::string stagingPath = m_StagingDir + "/step_r" + std::to_string(m_RankMPI) + "_" +
                                     std::to_string(m_WriterStep);
@@ -473,7 +474,8 @@ void BbviewWriter::EndStep()
 
     m_DataPos = finalPos + dataSize;
 
-    // hand off to the in-process bbviewd (was: xattr + socket message)
+    // hand off to the in-process drain workers (original bbview: xattr +
+    // socket message to bbviewd)
     {
         DrainJob job;
         job.Seq = m_NextDataSeq++;
@@ -495,25 +497,25 @@ void BbviewWriter::EndStep()
     ++m_WriterStep;
 }
 
-void BbviewWriter::Flush(const int /*transportIndex*/)
+void BbstageWriter::Flush(const int /*transportIndex*/)
 {
     if (m_CloseModeStaged)
     {
-        helper::Throw<std::logic_error>("Engine", "BbviewWriter", "Flush",
+        helper::Throw<std::logic_error>("Engine", "BbstageWriter", "Flush",
                                         "Flush() is not supported in staged close mode: data "
                                         "is staged at EndStep() and finalized in the background "
                                         "after Close()");
     }
     if (m_BetweenStepPairs)
     {
-        helper::Throw<std::logic_error>("Engine", "BbviewWriter", "Flush",
-                                        "Flush() inside a step is not supported by the bbview "
+        helper::Throw<std::logic_error>("Engine", "BbstageWriter", "Flush",
+                                        "Flush() inside a step is not supported by the bbstage "
                                         "engine; call it between EndStep() and BeginStep()");
     }
     DrainAndCommitAll();
 }
 
-void BbviewWriter::NotifyEngineAttribute(std::string /*name*/, AttributeBase *Attr,
+void BbstageWriter::NotifyEngineAttribute(std::string /*name*/, AttributeBase *Attr,
                                          void * /*data*/) noexcept
 {
     if (m_Parameters.UseOneTimeAttributes)
@@ -526,21 +528,21 @@ void BbviewWriter::NotifyEngineAttribute(std::string /*name*/, AttributeBase *At
     }
 }
 
-/* ---- drain machinery (daemonless bbviewd) -------------------------------- */
+/* ---- drain machinery (daemonless stand-in for bbviewd) --------------------- */
 
-void BbviewWriter::StartDrainThreads()
+void BbstageWriter::StartDrainThreads()
 {
     for (unsigned int i = 0; i < m_DrainThreads; ++i)
     {
-        m_DrainWorkers.emplace_back(&BbviewWriter::WorkerLoop, this);
+        m_DrainWorkers.emplace_back(&BbstageWriter::WorkerLoop, this);
     }
     if (m_RankMPI == 0)
     {
-        m_CommitterThread = std::thread(&BbviewWriter::CommitterLoop, this);
+        m_CommitterThread = std::thread(&BbstageWriter::CommitterLoop, this);
     }
 }
 
-void BbviewWriter::StopDrainThreads() noexcept
+void BbstageWriter::StopDrainThreads() noexcept
 {
     {
         std::lock_guard<std::mutex> lck(m_Mutex);
@@ -562,7 +564,7 @@ void BbviewWriter::StopDrainThreads() noexcept
     }
 }
 
-void BbviewWriter::WorkerLoop()
+void BbstageWriter::WorkerLoop()
 {
     for (;;)
     {
@@ -641,7 +643,7 @@ void BbviewWriter::WorkerLoop()
     }
 }
 
-void BbviewWriter::RunDataJob(DrainJob &job)
+void BbstageWriter::RunDataJob(DrainJob &job)
 {
     const int sfd = open(job.StagingPath.c_str(), O_RDONLY | O_CLOEXEC);
     if (sfd < 0)
@@ -663,7 +665,7 @@ void BbviewWriter::RunDataJob(DrainJob &job)
         if (n <= 0)
         {
             close(sfd);
-            helper::Throw<std::runtime_error>("Engine", "BbviewWriter", "RunDataJob",
+            helper::Throw<std::runtime_error>("Engine", "BbstageWriter", "RunDataJob",
                                               "short read of staging file " + job.StagingPath +
                                                   " at " + std::to_string(inOff) + " (" +
                                                   std::to_string(remain) + " bytes still due)");
@@ -683,12 +685,12 @@ void BbviewWriter::RunDataJob(DrainJob &job)
 
     if (m_Parameters.verbose > 2)
     {
-        std::cout << "bbview rank " << m_RankMPI << " drained step " << job.Step << " ("
+        std::cout << "bbstage rank " << m_RankMPI << " drained step " << job.Step << " ("
                   << job.DataSize << " bytes -> " << job.FinalPos << ")\n";
     }
 }
 
-void BbviewWriter::CommitterLoop()
+void BbstageWriter::CommitterLoop()
 {
     for (;;)
     {
@@ -739,7 +741,7 @@ void BbviewWriter::CommitterLoop()
     }
 }
 
-void BbviewWriter::RunCommitJob(const DrainJob &job)
+void BbstageWriter::RunCommitJob(const DrainJob &job)
 {
     if (!job.MMDBytes.empty())
     {
@@ -755,12 +757,12 @@ void BbviewWriter::RunCommitJob(const DrainJob &job)
 
     if (m_Parameters.verbose > 2)
     {
-        std::cout << "bbview committed step " << job.Step << " metadata at md pos "
+        std::cout << "bbstage committed step " << job.Step << " metadata at md pos "
                   << " size " << job.MDRecord.size() << "\n";
     }
 }
 
-void BbviewWriter::WaitForAllRanksDrained(size_t step)
+void BbstageWriter::WaitForAllRanksDrained(size_t step)
 {
     const auto start = std::chrono::steady_clock::now();
     const bool forever = (m_CommitTimeoutSecs <= 0.f);
@@ -779,7 +781,7 @@ void BbviewWriter::WaitForAllRanksDrained(size_t step)
             }
             if (m_Finishing)
             {
-                helper::Throw<std::logic_error>("Engine", "BbviewWriter",
+                helper::Throw<std::logic_error>("Engine", "BbstageWriter",
                                                 "WaitForAllRanksDrained",
                                                 "engine is closing; commit of step " +
                                                     std::to_string(step) + " abandoned");
@@ -791,7 +793,7 @@ void BbviewWriter::WaitForAllRanksDrained(size_t step)
         }
         if (!forever && (std::chrono::steady_clock::now() - start) > timeout)
         {
-            helper::Throw<std::runtime_error>("Engine", "BbviewWriter",
+            helper::Throw<std::runtime_error>("Engine", "BbstageWriter",
                                               "WaitForAllRanksDrained",
                                               "timeout waiting for own drain of step " +
                                                   std::to_string(step));
@@ -803,7 +805,7 @@ void BbviewWriter::WaitForAllRanksDrained(size_t step)
     const int size = m_Comm.Size();
     for (int r = 1; r < size; ++r)
     {
-        const std::string path = m_Name + "/bbview.drain." + std::to_string(r);
+        const std::string path = m_Name + "/bbstage.drain." + std::to_string(r);
         for (;;)
         {
             {
@@ -814,7 +816,7 @@ void BbviewWriter::WaitForAllRanksDrained(size_t step)
                 }
             }
             DrainProgress p;
-            if (BbviewReadProgress(path, p) && p.DrainedSteps >= step + 1)
+            if (BbstageReadProgress(path, p) && p.DrainedSteps >= step + 1)
             {
                 break;
             }
@@ -822,7 +824,7 @@ void BbviewWriter::WaitForAllRanksDrained(size_t step)
                 std::lock_guard<std::mutex> lck(m_Mutex);
                 if (m_Finishing)
                 {
-                    helper::Throw<std::logic_error>("Engine", "BbviewWriter",
+                    helper::Throw<std::logic_error>("Engine", "BbstageWriter",
                                                     "WaitForAllRanksDrained",
                                                     "engine is closing; commit of step " +
                                                         std::to_string(step) + " abandoned");
@@ -830,12 +832,12 @@ void BbviewWriter::WaitForAllRanksDrained(size_t step)
             }
             if (!forever && (std::chrono::steady_clock::now() - start) > timeout)
             {
-                helper::Throw<std::runtime_error>("Engine", "BbviewWriter",
+                helper::Throw<std::runtime_error>("Engine", "BbstageWriter",
                                                   "WaitForAllRanksDrained",
                                                   "timeout waiting for drain of step " +
                                                       std::to_string(step) + " on rank " +
                                                       std::to_string(r) + " (progress: " +
-                                                      (BbviewReadProgress(path, p)
+                                                      (BbstageReadProgress(path, p)
                                                            ? std::to_string(p.DrainedSteps) + " steps"
                                                            : std::string("no progress file")) +
                                                       ")");
@@ -845,7 +847,7 @@ void BbviewWriter::WaitForAllRanksDrained(size_t step)
     }
 }
 
-void BbviewWriter::WriteProgress(uint64_t drainedSteps, uint64_t drainedBytes)
+void BbstageWriter::WriteProgress(uint64_t drainedSteps, uint64_t drainedBytes)
 {
     // Called under m_Mutex, so no two threads can race the lazy create. The
     // open is deliberately off the open critical path: it happens on a drain
@@ -860,11 +862,11 @@ void BbviewWriter::WriteProgress(uint64_t drainedSteps, uint64_t drainedBytes)
                        std::to_string(m_RankMPI) + ", host " + m_Host + ")");
         }
     }
-    BbviewWriteProgressRecord(m_ProgressFd, m_ProgressPath, static_cast<uint64_t>(m_RankMPI),
+    BbstageWriteProgressRecord(m_ProgressFd, m_ProgressPath, static_cast<uint64_t>(m_RankMPI),
                               drainedSteps, drainedBytes, m_ProgressSeq, m_Host);
 }
 
-void BbviewWriter::CheckDrainError()
+void BbstageWriter::CheckDrainError()
 {
     std::exception_ptr err;
     {
@@ -877,7 +879,7 @@ void BbviewWriter::CheckDrainError()
     }
 }
 
-void BbviewWriter::DrainAndCommitAll()
+void BbstageWriter::DrainAndCommitAll()
 {
     CheckDrainError();
     {
@@ -905,7 +907,7 @@ void BbviewWriter::DrainAndCommitAll()
 
 /* ---- metadata ------------------------------------------------------------ */
 
-void BbviewWriter::AggregateAndEnqueueCommit(format::BP5Serializer::TimestepInfo &TSInfo,
+void BbstageWriter::AggregateAndEnqueueCommit(format::BP5Serializer::TimestepInfo &TSInfo,
                                              uint64_t finalPos, size_t dataSize)
 {
     core::iovec m{TSInfo.MetaEncodeBuffer->Data(), TSInfo.MetaEncodeBuffer->m_FixedSize};
@@ -958,7 +960,7 @@ void BbviewWriter::AggregateAndEnqueueCommit(format::BP5Serializer::TimestepInfo
 
     if (writerDataPos.size() != static_cast<size_t>(size))
     {
-        helper::Throw<std::logic_error>("Engine", "BbviewWriter", "AggregateAndEnqueueCommit",
+        helper::Throw<std::logic_error>("Engine", "BbstageWriter", "AggregateAndEnqueueCommit",
                                         "expected " + std::to_string(size) +
                                             " writer data positions, got " +
                                             std::to_string(writerDataPos.size()));
@@ -1054,7 +1056,7 @@ void BbviewWriter::AggregateAndEnqueueCommit(format::BP5Serializer::TimestepInfo
     m_CommitCV.notify_one();
 }
 
-void BbviewWriter::MakeBbHeader(std::vector<char> &buffer, size_t &position,
+void BbstageWriter::MakeBbHeader(std::vector<char> &buffer, size_t &position,
                                 const std::string & /*fileType*/, const bool isActive)
 {
     // Identical byte layout to BP5Writer::MakeHeader so bp5 readers accept it.
@@ -1124,7 +1126,7 @@ void BbviewWriter::MakeBbHeader(std::vector<char> &buffer, size_t &position,
     position = m_IndexHeaderSize;
 }
 
-void BbviewWriter::WriteIndexHeaderAndWriterMap()
+void BbstageWriter::WriteIndexHeaderAndWriterMap()
 {
     // md.idx: 64-byte Index Table header + a static WriterMapRecord mapping
     // every writer rank to its own data sub-file (EveryoneWrites style).
@@ -1155,7 +1157,7 @@ void BbviewWriter::WriteIndexHeaderAndWriterMap()
 
 /* ---- put ----------------------------------------------------------------- */
 
-void BbviewWriter::PutCommon(VariableBase &variable, const void *values, bool sync)
+void BbstageWriter::PutCommon(VariableBase &variable, const void *values, bool sync)
 {
     if (!m_BetweenStepPairs)
     {
@@ -1191,9 +1193,9 @@ void BbviewWriter::PutCommon(VariableBase &variable, const void *values, bool sy
 
     if (!variable.m_MemoryCount.empty())
     {
-        helper::Throw<std::invalid_argument>("Engine", "BbviewWriter", "PutCommon",
+        helper::Throw<std::invalid_argument>("Engine", "BbstageWriter", "PutCommon",
                                              "Put with MemoryCount/MemoryStart sub-blocks is "
-                                             "not supported by the bbview engine");
+                                             "not supported by the bbstage engine");
     }
 
     if (variable.m_Type == DataType::String)
@@ -1213,7 +1215,7 @@ void BbviewWriter::PutCommon(VariableBase &variable, const void *values, bool sy
 }
 
 template <class T>
-void BbviewWriter::PutCommonSpan(Variable<T> &variable, typename Variable<T>::Span &span,
+void BbstageWriter::PutCommonSpan(Variable<T> &variable, typename Variable<T>::Span &span,
                                  const bool initialize, const T &value)
 {
     format::BufferV::BufferPos bp5span(0, 0, 0);
@@ -1266,7 +1268,7 @@ void BbviewWriter::PutCommonSpan(Variable<T> &variable, typename Variable<T>::Sp
     }
 }
 
-void BbviewWriter::MarshalAttributes()
+void BbstageWriter::MarshalAttributes()
 {
     if (!m_MarshalAttributesNecessary)
     {
@@ -1336,7 +1338,7 @@ void BbviewWriter::MarshalAttributes()
 
 /* ---- close --------------------------------------------------------------- */
 
-void BbviewWriter::DoClose(const int /*transportIndex*/)
+void BbstageWriter::DoClose(const int /*transportIndex*/)
 {
     if (!m_IsOpen)
     {
@@ -1350,7 +1352,7 @@ void BbviewWriter::DoClose(const int /*transportIndex*/)
         const double ms = std::chrono::duration<double, std::milli>(
                               std::chrono::steady_clock::now() - tCloseStart)
                               .count();
-        std::cerr << "bbview rank " << m_RankMPI << " close-phase " << phase << " @"
+        std::cerr << "bbstage rank " << m_RankMPI << " close-phase " << phase << " @"
                   << static_cast<long long>(ms) << " ms\n";
         std::cerr.flush();
     };
@@ -1363,11 +1365,11 @@ void BbviewWriter::DoClose(const int /*transportIndex*/)
         // which drains to the final store and commits the metadata in the
         // background while the application computes. The finalizer's
         // destructor (clean process exit) is the durability barrier; a crash
-        // loses the sessions that were not finalized yet (no bbview.final
+        // loses the sessions that were not finalized yet (no bbstage.final
         // marker).
-        BbviewStagedFinalizer::Instance().CheckError();
+        BbstageStagedFinalizer::Instance().CheckError();
 
-        BbviewStagedFinalizer::Session session;
+        BbstageStagedFinalizer::Session session;
         session.FinalDir = m_Name;
         session.DataFileName = m_DataFileName;
         session.StagingDir = m_StagingDir;
@@ -1400,7 +1402,7 @@ void BbviewWriter::DoClose(const int /*transportIndex*/)
         session.DeleteStagedFiles = m_DeleteStagedFiles;
         session.CommitPollMs = m_CommitPollMs;
         session.CommitTimeoutSecs = m_CommitTimeoutSecs;
-        BbviewStagedFinalizer::Instance().RegisterSession(std::move(session));
+        BbstageStagedFinalizer::Instance().RegisterSession(std::move(session));
         m_StagingDir.clear(); // owned by the finalizer now
         closePhase("staged-handoff");
         m_Comm.Barrier();
@@ -1506,7 +1508,7 @@ void BbviewWriter::DoClose(const int /*transportIndex*/)
     }
 }
 
-void BbviewWriter::DestructorClose(bool /*Verbose*/) noexcept
+void BbstageWriter::DestructorClose(bool /*Verbose*/) noexcept
 {
     // Abandoned open engine: staged-but-undrained data is lost, which is the
     // documented burst-buffer contract (Close() is the durability point).
@@ -1529,15 +1531,15 @@ void BbviewWriter::DestructorClose(bool /*Verbose*/) noexcept
 /* ---- put dispatch -------------------------------------------------------- */
 
 #define declare_type(T)                                                                            \
-    void BbviewWriter::DoPutSync(Variable<T> &variable, const T *data)                             \
+    void BbstageWriter::DoPutSync(Variable<T> &variable, const T *data)                             \
     {                                                                                              \
         PutCommon(variable, data, true);                                                           \
     }                                                                                              \
-    void BbviewWriter::DoPutDeferred(Variable<T> &variable, const T *data)                         \
+    void BbstageWriter::DoPutDeferred(Variable<T> &variable, const T *data)                         \
     {                                                                                              \
         PutCommon(variable, data, false);                                                          \
     }                                                                                              \
-    size_t BbviewWriter::PutCount(Variable<T> &variable)                                           \
+    size_t BbstageWriter::PutCount(Variable<T> &variable)                                           \
     {                                                                                              \
         return m_BP5Serializer.PutCount((void *)&variable);                                        \
     }
@@ -1546,7 +1548,7 @@ ADIOS2_FOREACH_STDTYPE_1ARG(declare_type)
 #undef declare_type
 
 #define declare_type(T)                                                                            \
-    void BbviewWriter::DoPut(Variable<T> &variable, typename Variable<T>::Span &span,              \
+    void BbstageWriter::DoPut(Variable<T> &variable, typename Variable<T>::Span &span,              \
                              const bool initialize, const T &value)                                \
     {                                                                                              \
         PutCommonSpan(variable, span, initialize, value);                                          \
@@ -1556,7 +1558,7 @@ ADIOS2_FOREACH_PRIMITIVE_STDTYPE_1ARG(declare_type)
 #undef declare_type
 
 #define declare_type(T, L)                                                                         \
-    T *BbviewWriter::DoBufferData_##L(const int bufferIdx, const size_t payloadPosition,           \
+    T *BbstageWriter::DoBufferData_##L(const int bufferIdx, const size_t payloadPosition,           \
                                       const size_t bufferID) noexcept                              \
     {                                                                                              \
         return reinterpret_cast<T *>(m_BP5Serializer.GetPtr(bufferIdx, payloadPosition));          \
@@ -1565,12 +1567,12 @@ ADIOS2_FOREACH_PRIMITIVE_STDTYPE_1ARG(declare_type)
 ADIOS2_FOREACH_PRIMITVE_STDTYPE_2ARGS(declare_type)
 #undef declare_type
 
-void BbviewWriter::DoPutStructSync(VariableStruct &variable, const void *data)
+void BbstageWriter::DoPutStructSync(VariableStruct &variable, const void *data)
 {
     PutCommon(variable, data, true);
 }
 
-void BbviewWriter::DoPutStructDeferred(VariableStruct &variable, const void *data)
+void BbstageWriter::DoPutStructDeferred(VariableStruct &variable, const void *data)
 {
     PutCommon(variable, data, false);
 }

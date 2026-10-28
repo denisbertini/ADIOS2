@@ -338,13 +338,13 @@ if(ADIOS2_HAVE_DAOS)
 endif()
 
 if(NOT WIN32)
-  # bbview: daemonless view-aware burst buffer engine (POSIX-only staging)
+  # bbstage: node-local staging + asynchronous drain BP5 writer (POSIX-only)
   target_sources(adios2_core PRIVATE
-    engine/bbview/BbviewWriter.cpp
-    engine/bbview/BbviewDrainCommon.cpp
-    engine/bbview/BbviewStagedFinalizer.cpp
+    engine/bbstage/BbstageWriter.cpp
+    engine/bbstage/BbstageDrainCommon.cpp
+    engine/bbstage/BbstageStagedFinalizer.cpp
   )
-  target_compile_definitions(adios2_core PRIVATE ADIOS2_HAVE_BBVIEW)
+  target_compile_definitions(adios2_core PRIVATE ADIOS2_HAVE_BBSTAGE)
 endif()
 
 if(ADIOS2_HAVE_MPI)

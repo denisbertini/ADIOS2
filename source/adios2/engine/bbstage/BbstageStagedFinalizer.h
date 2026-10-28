@@ -4,10 +4,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#ifndef ADIOS2_ENGINE_BBVIEW_BBVIEWSTAGEDFINALIZER_H_
-#define ADIOS2_ENGINE_BBVIEW_BBVIEWSTAGEDFINALIZER_H_
+#ifndef ADIOS2_ENGINE_BBSTAGE_BBSTAGESTAGEDFINALIZER_H_
+#define ADIOS2_ENGINE_BBSTAGE_BBSTAGESTAGEDFINALIZER_H_
 
-#include "adios2/engine/bbview/BbviewDrainCommon.h"
+#include "adios2/engine/bbstage/BbstageDrainCommon.h"
 #include "adios2/toolkit/transport/Transport.h"
 
 #include <cstddef>
@@ -28,7 +28,7 @@ namespace core
 namespace engine
 {
 
-/** Process-level finalizer for the bbview "staged close" mode
+/** Process-level finalizer for the bbstage "staged close" mode
  * (CloseMode=staged).
  *
  * In staged mode the application-visible checkpoint cost ends at the
@@ -47,14 +47,14 @@ namespace engine
  *    normal exit path) is the final barrier;
  *  - a CRASH before a session is finalized loses that checkpoint: the final
  *    directory holds partial data files, an incomplete md.idx, and no
- *    "bbview.final" marker; a restart goes back to the last finalized
+ *    "bbstage.final" marker; a restart goes back to the last finalized
  *    checkpoint;
  *  - finalization (rank 0) writes the md.idx inactive flag, closes the
- *    metadata files, and atomically publishes <finalDir>/bbview.final; the
+ *    metadata files, and atomically publishes <finalDir>/bbstage.final; the
  *    marker's presence is the visibility/durability point for readers and
  *    for restart policies.
  */
-class BbviewStagedFinalizer
+class BbstageStagedFinalizer
 {
 public:
     /** One checkpoint file handed over by a staged Close(). */
@@ -79,8 +79,8 @@ public:
         std::shared_ptr<Transport> MDIndexFile;
 
         // handed-over job state
-        std::deque<BbviewDrainJob> DataQueue;
-        std::deque<BbviewDrainJob> CommitQueue;
+        std::deque<BbstageDrainJob> DataQueue;
+        std::deque<BbstageDrainJob> CommitQueue;
         size_t NextDataSeq = 0;
         size_t DrainedWatermark = 0;
         uint64_t PublishedSteps = 0;
@@ -97,13 +97,13 @@ public:
 
         // lifecycle (worker threads only, under the finalizer mutex)
         bool DataDone = false;
-        bool Finalized = false; // rank 0: md closed + bbview.final published
+        bool Finalized = false; // rank 0: md closed + bbstage.final published
     };
 
-    static BbviewStagedFinalizer &Instance();
+    static BbstageStagedFinalizer &Instance();
 
     // use Instance(); direct construction is only for the singleton itself
-    BbviewStagedFinalizer() = default;
+    BbstageStagedFinalizer() = default;
 
     /** Hand over a closed session; the workers start on the first call. */
     void RegisterSession(Session session);
@@ -118,15 +118,15 @@ public:
     void AccountStaged(uint64_t bytes);
     void SetStagingWatermark(uint64_t bytes);
 
-    ~BbviewStagedFinalizer();
-    BbviewStagedFinalizer(const BbviewStagedFinalizer &) = delete;
-    BbviewStagedFinalizer &operator=(const BbviewStagedFinalizer &) = delete;
+    ~BbstageStagedFinalizer();
+    BbstageStagedFinalizer(const BbstageStagedFinalizer &) = delete;
+    BbstageStagedFinalizer &operator=(const BbstageStagedFinalizer &) = delete;
 
 private:
     void DrainWorkerLoop();
     void CommitWorkerLoop();
-    void RunDataJob(Session &s, BbviewDrainJob &job);
-    void RunCommitJob(Session &s, const BbviewDrainJob &job);
+    void RunDataJob(Session &s, BbstageDrainJob &job);
+    void RunCommitJob(Session &s, const BbstageDrainJob &job);
     void WaitForSessionDrained(Session &s, size_t step);
     void FinalizeSession(Session &s);
     void PublishProgress(Session &s); // called under m_Mutex
@@ -157,4 +157,4 @@ private:
 } // end namespace core
 } // end namespace adios2
 
-#endif // ADIOS2_ENGINE_BBVIEW_BBVIEWSTAGEDFINALIZER_H_
+#endif // ADIOS2_ENGINE_BBSTAGE_BBSTAGESTAGEDFINALIZER_H_

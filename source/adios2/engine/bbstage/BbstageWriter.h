@@ -4,13 +4,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#ifndef ADIOS2_ENGINE_BBVIEW_BBVIEWWRITER_H_
-#define ADIOS2_ENGINE_BBVIEW_BBVIEWWRITER_H_
+#ifndef ADIOS2_ENGINE_BBSTAGE_BBSTAGEWRITER_H_
+#define ADIOS2_ENGINE_BBSTAGE_BBSTAGEWRITER_H_
 
 #include "adios2/common/ADIOSConfig.h"
 #include "adios2/core/Engine.h"
-#include "adios2/engine/bbview/BbviewDrainCommon.h"
-#include "adios2/engine/bbview/BbviewStagedFinalizer.h"
+#include "adios2/engine/bbstage/BbstageDrainCommon.h"
+#include "adios2/engine/bbstage/BbstageStagedFinalizer.h"
 #include "adios2/engine/bp5/BP5Engine.h"
 #include "adios2/toolkit/format/bp5/BP5Serializer.h"
 #include "adios2/toolkit/transport/Transport.h"
@@ -33,35 +33,37 @@ namespace core
 namespace engine
 {
 
-/** Engine "bbview": daemonless view-aware burst buffer, porting the ideas of
- * bbview (Koyama & Tatebe, "BBView: A View-Aware Burst-Buffer Mechanism for
- * MPI-IO", REX-IO 2025) from an Open MPI ompio component + bbviewd daemon to
- * a pure in-process ADIOS2 transport.
+/** Engine "bbstage": write-only BP5 engine with node-local burst-buffer
+ * staging and asynchronous drain.
  *
- * The bbview idea: the application's payload is written to node-local SSD in
- * a cheap layout as fast as possible, while the expensive placement work and
- * the actual layout transformation are deferred to a background agent that
- * replays the data onto the final storage. In bbview this is the MPI file
- * view deferred from write time to staging-out time by bbviewd. In ADIOS2 the
- * same contract is implemented without any daemon:
+ * Design lineage: the "spill the payload to node-local media as fast as
+ * possible, drain to the final store in the background" approach follows
+ * bbview (Koyama & Tatebe, "BBView: A View-Aware Burst-Buffer Mechanism for
+ * MPI-IO", REX-IO 2025). bbview defers an MPI file-view transformation to a
+ * separate daemon (bbviewd); this engine keeps only the staging +
+ * background-drain idea and implements it fully in-process. The staged
+ * payload is already serialized in final BP5 layout, so the background work
+ * is a byte copy plus a metadata commit -- there is no view descriptor and
+ * no data re-organization.
  *
  *   - EndStep() serializes the step in memory (BP5Serializer), then writes
  *     the step payload synchronously to a per-rank staging file on
  *     node-local SSD (BurstBufferPath). This is the app-visible cost: a
- *     single sequential local write, like bbview's staging file.
- *   - One or more in-process worker threads (replacing bbviewd) drain the
- *     staging files to the final store at the pre-assigned data offsets.
- *   - The per-step metadata (the ADIOS2 analogue of the "view descriptor")
- *     is aggregated collectively at EndStep() time, but its *commit* to the
- *     BP5 metadata files (.bp md.0/md.idx/mmd.0) is performed by a
- *     rank-0 committer thread only once the data of that step has been
- *     drained by every writer rank. The metadata commit is the visibility
- *     point, so a standard "bp5" reader (including streaming readers) never
- *     observes a step whose data is not yet on the final store.
- *   - In-process hand-off replaces bbview's /tmp/bbview.sock + xattr
- *     protocol with an in-memory FIFO queue plus a small fixed-size drain
- *     progress file per writer in the output directory, letting the rank-0
- *     committer gate metadata commits.
+ *     single sequential local write.
+ *   - One or more in-process worker threads (the daemonless stand-in for
+ *     bbviewd) drain the staging files to the final store at the
+ *     pre-assigned data offsets.
+ *   - The per-step metadata is aggregated collectively at EndStep() time,
+ *     but its *commit* to the BP5 metadata files (.bp md.0/md.idx/mmd.0) is
+ *     performed by a rank-0 committer thread only once the data of that
+ *     step has been drained by every writer rank. The metadata commit is the
+ *     visibility point, so a standard "bp5" reader (including streaming
+ *     readers) never observes a step whose data is not yet on the final
+ *     store.
+ *   - Hand-off is an in-memory FIFO queue plus a small fixed-size drain
+ *     progress file per writer in the output directory (bbstage.drain.<r>),
+ *     letting the rank-0 committer gate metadata commits; this replaces
+ *     bbview's /tmp/bbview.sock + xattr protocol.
  *   - Unlike bbview's fire-and-forget flush, drain errors are recorded and
  *     rethrown to the application at the next EndStep()/Flush()/Close(), and
  *     commit waiting is subject to a configurable timeout.
@@ -82,7 +84,7 @@ namespace engine
  *
  *   DrainThreads        number of drain worker threads per rank (default 1)
  *   StagingSync         fsync staging file in EndStep (default false,
- *                       mirrors bbview page-cache semantics)
+ *                       page-cache semantics, like the original bbview)
  *   DrainDataSync       fsync final data file after every drain barrier
  *                       at Flush()/Close() (default false)
  *   CommitPollMs        committer poll interval for drain progress
@@ -95,23 +97,23 @@ namespace engine
  *                       returns as soon as the last step is written to the
  *                       node-local burst buffer; the drain and the metadata
  *                       commit then run in the process background
- *                       (BbviewStagedFinalizer) while the application
+ *                       (BbstageStagedFinalizer) while the application
  *                       computes. A clean process exit finalizes every
  *                       pending session before the process ends; a crash
  *                       loses the checkpoints that were staged but not yet
  *                       finalized. Finalization publishes
- *                       <finalDir>/bbview.final, the durability/visibility
+ *                       <finalDir>/bbstage.final, the durability/visibility
  *                       marker for readers and restart policies.
  *   StagingWatermarkMB  staged mode: per-rank cap on staged-but-undrained
  *                       bytes; EndStep() blocks above it so the node-local
  *                       burst buffer cannot fill (default 1024, 0 =
  *                       unlimited)
  */
-class BbviewWriter : public BP5Engine, public core::Engine
+class BbstageWriter : public BP5Engine, public core::Engine
 {
 public:
-    BbviewWriter(IO &io, const std::string &name, const Mode mode, helper::Comm comm);
-    ~BbviewWriter() override;
+    BbstageWriter(IO &io, const std::string &name, const Mode mode, helper::Comm comm);
+    ~BbstageWriter() override;
 
     StepStatus BeginStep(StepMode mode, const float timeoutSeconds = -1.0) final;
     size_t CurrentStep() const final;
@@ -123,8 +125,8 @@ public:
 
 private:
     // drain protocol types shared with the staged-close finalizer
-    using DrainJob = BbviewDrainJob;
-    using DrainProgress = BbviewDrainProgress;
+    using DrainJob = BbstageDrainJob;
+    using DrainProgress = BbstageDrainProgress;
 
     // engine lifecycle
     void Init() final;
@@ -140,7 +142,7 @@ private:
                        const bool initialize, const T &value);
     void MarshalAttributes();
 
-    // drain machinery (the daemonless bbviewd)
+    // drain machinery (the daemonless stand-in for bbviewd)
     void StartDrainThreads();
     void StopDrainThreads() noexcept;
     void WorkerLoop();
@@ -159,7 +161,7 @@ private:
                       const bool isActive);
     void WriteIndexHeaderAndWriterMap();
 
-    // bbview-specific parameters
+    // bbstage-specific parameters
     unsigned int m_DrainThreads = 1;
     bool m_StagingSync = false;
     bool m_DrainDataSync = false;
@@ -179,7 +181,7 @@ private:
     std::shared_ptr<Transport> m_MMDFile;
     std::shared_ptr<Transport> m_MDIndexFile;
 
-    // node-local burst buffer (bbview's BBVIEW_TMP_DIR)
+    // node-local burst buffer (cf. the original bbview's BBVIEW_TMP_DIR)
     std::string m_BurstBufferPath;
     std::string m_StagingDir;
     std::string m_ProgressPath;
@@ -242,4 +244,4 @@ private:
 } // end namespace core
 } // end namespace adios2
 
-#endif /* ADIOS2_ENGINE_BBVIEW_BBVIEWWRITER_H_ */
+#endif /* ADIOS2_ENGINE_BBSTAGE_BBSTAGEWRITER_H_ */

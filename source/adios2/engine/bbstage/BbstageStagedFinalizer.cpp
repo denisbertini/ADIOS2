@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "BbviewStagedFinalizer.h"
+#include "BbstageStagedFinalizer.h"
 
 #include "adios2/engine/bp5/BP5Engine.h" // m_ActiveFlagPosition
 
@@ -30,11 +30,11 @@ namespace engine
 
 namespace
 {
-constexpr size_t DrainCopyBufferSize = 4 * 1024 * 1024; // like bbviewd's replay buffer
+constexpr size_t DrainCopyBufferSize = 4 * 1024 * 1024; // cf. bbviewd's replay buffer
 
 [[noreturn]] void ThrowPosix(const std::string &what)
 {
-    throw std::runtime_error("bbview finalizer: " + what + ": " + std::strerror(errno));
+    throw std::runtime_error("bbstage finalizer: " + what + ": " + std::strerror(errno));
 }
 
 void PwriteAll(int fd, const char *ptr, size_t size, uint64_t offset)
@@ -57,23 +57,23 @@ void PwriteAll(int fd, const char *ptr, size_t size, uint64_t offset)
     }
 }
 
-BbviewStagedFinalizer &GetFinalizer()
+BbstageStagedFinalizer &GetFinalizer()
 {
-    static BbviewStagedFinalizer instance;
+    static BbstageStagedFinalizer instance;
     return instance;
 }
 
 } // end anonymous namespace
 
-BbviewStagedFinalizer &BbviewStagedFinalizer::Instance() { return GetFinalizer(); }
+BbstageStagedFinalizer &BbstageStagedFinalizer::Instance() { return GetFinalizer(); }
 
-void BbviewStagedFinalizer::SetStagingWatermark(uint64_t bytes)
+void BbstageStagedFinalizer::SetStagingWatermark(uint64_t bytes)
 {
     std::lock_guard<std::mutex> lck(m_Mutex);
     m_StagingWatermark = bytes;
 }
 
-void BbviewStagedFinalizer::AccountStaged(uint64_t bytes)
+void BbstageStagedFinalizer::AccountStaged(uint64_t bytes)
 {
     std::unique_lock<std::mutex> lck(m_Mutex);
     if (m_Error)
@@ -95,7 +95,7 @@ void BbviewStagedFinalizer::AccountStaged(uint64_t bytes)
     m_PendingStaged += bytes;
 }
 
-void BbviewStagedFinalizer::CheckError()
+void BbstageStagedFinalizer::CheckError()
 {
     std::exception_ptr err;
     {
@@ -108,16 +108,16 @@ void BbviewStagedFinalizer::CheckError()
     }
 }
 
-void BbviewStagedFinalizer::RegisterSession(Session session)
+void BbstageStagedFinalizer::RegisterSession(Session session)
 {
     std::lock_guard<std::mutex> lck(m_Mutex);
     if (!m_WorkersStarted)
     {
         m_Rank = session.Rank;
-        m_DrainWorker = std::thread(&BbviewStagedFinalizer::DrainWorkerLoop, this);
+        m_DrainWorker = std::thread(&BbstageStagedFinalizer::DrainWorkerLoop, this);
         if (m_Rank == 0)
         {
-            m_CommitWorker = std::thread(&BbviewStagedFinalizer::CommitWorkerLoop, this);
+            m_CommitWorker = std::thread(&BbstageStagedFinalizer::CommitWorkerLoop, this);
         }
         m_WorkersStarted = true;
     }
@@ -130,7 +130,7 @@ void BbviewStagedFinalizer::RegisterSession(Session session)
     m_CommitCV.notify_all();
 }
 
-BbviewStagedFinalizer::~BbviewStagedFinalizer()
+BbstageStagedFinalizer::~BbstageStagedFinalizer()
 {
     // Exit barrier: on a clean process exit, complete every pending session
     // before the process ends. The workers never use MPI (all coordination
@@ -160,20 +160,20 @@ BbviewStagedFinalizer::~BbviewStagedFinalizer()
         catch (const std::exception &e)
         {
             std::fprintf(stderr,
-                         "bbview finalizer: background finalization failed; one or more "
+                         "bbstage finalizer: background finalization failed; one or more "
                          "checkpoints may be incomplete: %s\n",
                          e.what());
         }
         catch (...)
         {
             std::fprintf(stderr,
-                         "bbview finalizer: background finalization failed; one or more "
+                         "bbstage finalizer: background finalization failed; one or more "
                          "checkpoints may be incomplete\n");
         }
     }
 }
 
-void BbviewStagedFinalizer::RunDataJob(Session &s, BbviewDrainJob &job)
+void BbstageStagedFinalizer::RunDataJob(Session &s, BbstageDrainJob &job)
 {
     const int sfd = open(job.StagingPath.c_str(), O_RDONLY | O_CLOEXEC);
     if (sfd < 0)
@@ -195,7 +195,7 @@ void BbviewStagedFinalizer::RunDataJob(Session &s, BbviewDrainJob &job)
         if (n <= 0)
         {
             close(sfd);
-            throw std::runtime_error("bbview finalizer: short read of staging file " +
+            throw std::runtime_error("bbstage finalizer: short read of staging file " +
                                      job.StagingPath + " at " + std::to_string(inOff) + " (" +
                                      std::to_string(remain) + " bytes still due)");
         }
@@ -214,13 +214,13 @@ void BbviewStagedFinalizer::RunDataJob(Session &s, BbviewDrainJob &job)
 
     if (s.Verbose > 2)
     {
-        std::cout << "bbview finalizer rank " << s.Rank << " drained step " << job.Step
+        std::cout << "bbstage finalizer rank " << s.Rank << " drained step " << job.Step
                   << " (" << job.DataSize << " bytes -> " << job.FinalPos << ") of " << s.FinalDir
                   << "\n";
     }
 }
 
-void BbviewStagedFinalizer::PublishProgress(Session &s)
+void BbstageStagedFinalizer::PublishProgress(Session &s)
 {
     // Called under m_Mutex by the single drain worker, so no two threads can
     // race the lazy create or the sequence counter.
@@ -234,16 +234,16 @@ void BbviewStagedFinalizer::PublishProgress(Session &s)
                         std::to_string(s.Rank) + ", host " + s.Host + ")");
         }
     }
-    BbviewWriteProgressRecord(s.ProgressFd, s.ProgressPath, static_cast<uint64_t>(s.Rank),
+    BbstageWriteProgressRecord(s.ProgressFd, s.ProgressPath, static_cast<uint64_t>(s.Rank),
                               s.DrainedWatermark, s.ProgressBytes, s.ProgressSeq, s.Host);
 }
 
-void BbviewStagedFinalizer::DrainWorkerLoop()
+void BbstageStagedFinalizer::DrainWorkerLoop()
 {
     for (;;)
     {
         std::shared_ptr<Session> s;
-        BbviewDrainJob job;
+        BbstageDrainJob job;
         bool have = false;
         {
             std::unique_lock<std::mutex> lck(m_Mutex);
@@ -363,7 +363,7 @@ void BbviewStagedFinalizer::DrainWorkerLoop()
                 }
                 if (s->Verbose > 1)
                 {
-                    std::cout << "bbview finalizer rank " << s->Rank << ": all data of "
+                    std::cout << "bbstage finalizer rank " << s->Rank << ": all data of "
                               << s->FinalDir << " drained\n";
                 }
                 // release sessions fully done on this rank (rank != 0 has no
@@ -398,7 +398,7 @@ void BbviewStagedFinalizer::DrainWorkerLoop()
     }
 }
 
-void BbviewStagedFinalizer::RunCommitJob(Session &s, const BbviewDrainJob &job)
+void BbstageStagedFinalizer::RunCommitJob(Session &s, const BbstageDrainJob &job)
 {
     if (!job.MMDBytes.empty())
     {
@@ -414,12 +414,12 @@ void BbviewStagedFinalizer::RunCommitJob(Session &s, const BbviewDrainJob &job)
 
     if (s.Verbose > 2)
     {
-        std::cout << "bbview finalizer committed step " << job.Step << " metadata of "
+        std::cout << "bbstage finalizer committed step " << job.Step << " metadata of "
                   << s.FinalDir << "\n";
     }
 }
 
-void BbviewStagedFinalizer::WaitForSessionDrained(Session &s, size_t step)
+void BbstageStagedFinalizer::WaitForSessionDrained(Session &s, size_t step)
 {
     const auto start = std::chrono::steady_clock::now();
     const bool forever = (s.CommitTimeoutSecs <= 0.f);
@@ -443,7 +443,7 @@ void BbviewStagedFinalizer::WaitForSessionDrained(Session &s, size_t step)
         }
         if (!forever && (std::chrono::steady_clock::now() - start) > timeout)
         {
-            throw std::runtime_error("bbview finalizer: timeout waiting for own drain of "
+            throw std::runtime_error("bbstage finalizer: timeout waiting for own drain of "
                                      "step " + std::to_string(step) + " of " + s.FinalDir);
         }
         std::this_thread::sleep_for(poll);
@@ -453,7 +453,7 @@ void BbviewStagedFinalizer::WaitForSessionDrained(Session &s, size_t step)
     // only exists on rank 0, so ranks 1..WriterCount-1 are the peers)
     for (int r = 1; r < s.WriterCount; ++r)
     {
-        const std::string path = s.FinalDir + "/bbview.drain." + std::to_string(r);
+        const std::string path = s.FinalDir + "/bbstage.drain." + std::to_string(r);
         for (;;)
         {
             {
@@ -463,17 +463,17 @@ void BbviewStagedFinalizer::WaitForSessionDrained(Session &s, size_t step)
                     std::rethrow_exception(m_Error);
                 }
             }
-            BbviewDrainProgress p;
-            if (BbviewReadProgress(path, p) && p.DrainedSteps >= step + 1)
+            BbstageDrainProgress p;
+            if (BbstageReadProgress(path, p) && p.DrainedSteps >= step + 1)
             {
                 break;
             }
             if (!forever && (std::chrono::steady_clock::now() - start) > timeout)
             {
-                throw std::runtime_error("bbview finalizer: timeout waiting for drain of "
+                throw std::runtime_error("bbstage finalizer: timeout waiting for drain of "
                                          "step " + std::to_string(step) + " on rank " +
                                          std::to_string(r) + " (progress: " +
-                                         (BbviewReadProgress(path, p)
+                                         (BbstageReadProgress(path, p)
                                               ? std::to_string(p.DrainedSteps) + " steps"
                                               : std::string("no progress file")) +
                                          ")");
@@ -483,7 +483,7 @@ void BbviewStagedFinalizer::WaitForSessionDrained(Session &s, size_t step)
     }
 }
 
-void BbviewStagedFinalizer::FinalizeSession(Session &s)
+void BbstageStagedFinalizer::FinalizeSession(Session &s)
 {
     // final active flag = 0 in md.idx header (same as the durable path)
     const char inactive = 0;
@@ -510,15 +510,15 @@ void BbviewStagedFinalizer::FinalizeSession(Session &s)
     std::error_code ec;
     for (int r = 0; r < s.WriterCount; ++r)
     {
-        std::filesystem::remove(s.FinalDir + "/bbview.drain." + std::to_string(r), ec);
+        std::filesystem::remove(s.FinalDir + "/bbstage.drain." + std::to_string(r), ec);
     }
 
     // publish the durability/visibility marker: tmp + rename with retry,
     // since on network final stores a rename of a just-created tmp file can
     // transiently fail with ENOENT due to stale lookups
-    const std::string tmp = s.FinalDir + "/bbview.final.tmp";
-    const std::string fin = s.FinalDir + "/bbview.final";
-    const std::string content = "bbview finalized: " + s.FinalDir + "\n";
+    const std::string tmp = s.FinalDir + "/bbstage.final.tmp";
+    const std::string fin = s.FinalDir + "/bbstage.final";
+    const std::string content = "bbstage finalized: " + s.FinalDir + "\n";
     for (int attempt = 0; attempt < 50; ++attempt)
     {
         {
@@ -555,27 +555,27 @@ void BbviewStagedFinalizer::FinalizeSession(Session &s)
             std::filesystem::remove(tmp, ec);
             if (s.Verbose > 1)
             {
-                std::cout << "bbview finalizer: session finalized " << s.FinalDir << "\n";
+                std::cout << "bbstage finalizer: session finalized " << s.FinalDir << "\n";
             }
             return;
         }
         if (attempt == 49)
         {
-            throw std::runtime_error("bbview finalizer: cannot publish marker " + fin + ": " +
+            throw std::runtime_error("bbstage finalizer: cannot publish marker " + fin + ": " +
                                      std::strerror(errno));
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
-    throw std::runtime_error("bbview finalizer: cannot write marker " + tmp + ": " +
+    throw std::runtime_error("bbstage finalizer: cannot write marker " + tmp + ": " +
                              std::strerror(errno));
 }
 
-void BbviewStagedFinalizer::CommitWorkerLoop()
+void BbstageStagedFinalizer::CommitWorkerLoop()
 {
     for (;;)
     {
         std::shared_ptr<Session> s;
-        BbviewDrainJob job;
+        BbstageDrainJob job;
         bool have = false;
         std::vector<std::shared_ptr<Session>> toFinalize;
         {

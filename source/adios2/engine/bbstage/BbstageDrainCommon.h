@@ -4,8 +4,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#ifndef ADIOS2_ENGINE_BBVIEW_BBVIEWDRAINCOMMON_H_
-#define ADIOS2_ENGINE_BBVIEW_BBVIEWDRAINCOMMON_H_
+#ifndef ADIOS2_ENGINE_BBSTAGE_BBSTAGEDRAINCOMMON_H_
+#define ADIOS2_ENGINE_BBSTAGE_BBSTAGEDRAINCOMMON_H_
 
 #include <cstddef>
 #include <cstdint>
@@ -21,13 +21,14 @@ namespace core
 namespace engine
 {
 
-/** One unit of deferred work handed to the in-process "bbviewd" threads.
+/** One unit of deferred work handed to the in-process drain worker threads
+ * (the daemonless stand-in for bbviewd).
  * Data jobs: copy staging file -> final data file at FinalPos.
  * Commit jobs (rank 0 only): append per-step metadata once the step is
  * drained on every writer rank.
  * Shared by the engine (durable close mode) and the process-level finalizer
- * (staged close mode, BbviewStagedFinalizer). */
-struct BbviewDrainJob
+ * (staged close mode, BbstageStagedFinalizer). */
+struct BbstageDrainJob
 {
     size_t Seq = 0; // data job sequence number (one data job per step)
     size_t Step = 0;
@@ -43,18 +44,19 @@ struct BbviewDrainJob
 };
 
 /** Fixed-size drain progress record, the in-process replacement for
- * bbview's out-of-band xattr handoff. Published by each writer rank with
+ * the original bbview's out-of-band xattr handoff. Published by each writer
+ * rank with
  * a single pwrite at offset 0 of a pre-created file in the output
  * directory, guarded by a sequence lock (Seq/SeqCopy). tmp+rename was
  * avoided on purpose: on network/FUSE final stores a rename of a
  * just-created tmp file can transiently fail with ENOENT due to stale
  * lookups. Readers reject records whose sequence numbers disagree;
  * tearing can therefore only make progress look older, never newer. */
-constexpr uint64_t BbviewDrainMagicValue = 0x42425644ULL; // "BBVD"
+constexpr uint64_t BbstageDrainMagicValue = 0x42425344ULL; // "BBSD"
 
-struct BbviewDrainProgress
+struct BbstageDrainProgress
 {
-    uint64_t Magic = BbviewDrainMagicValue;
+    uint64_t Magic = BbstageDrainMagicValue;
     uint64_t Version = 1;
     uint64_t Rank = 0;
     uint64_t Seq = 0;          // incremented on every publish
@@ -65,13 +67,13 @@ struct BbviewDrainProgress
 
 /** Read one progress record. Returns false when the file is missing or the
  * record is not (fully) written / is mid-update; the caller polls. */
-bool BbviewReadProgress(const std::string &path, BbviewDrainProgress &out);
+bool BbstageReadProgress(const std::string &path, BbstageDrainProgress &out);
 
 /** Publish one progress record to an open fd (the caller owns the fd and
  * the per-session sequence counter). Single fixed-offset pwrite of the
  * whole record: no tmp file, no rename. Throws std::runtime_error on a
  * persistent pwrite failure. */
-void BbviewWriteProgressRecord(int fd, const std::string &path, uint64_t rank,
+void BbstageWriteProgressRecord(int fd, const std::string &path, uint64_t rank,
                                uint64_t drainedSteps, uint64_t drainedBytes,
                                uint64_t &seq, const std::string &host);
 
@@ -79,4 +81,4 @@ void BbviewWriteProgressRecord(int fd, const std::string &path, uint64_t rank,
 } // end namespace core
 } // end namespace adios2
 
-#endif // ADIOS2_ENGINE_BBVIEW_BBVIEWDRAINCOMMON_H_
+#endif // ADIOS2_ENGINE_BBSTAGE_BBSTAGEDRAINCOMMON_H_
