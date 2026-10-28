@@ -29,6 +29,13 @@ It transports self-describing variables and attributes across files, networks, a
 - **Widely available**: packaged for major Linux distributions, Conda, Spack, Homebrew, and vcpkg; validated on U.S. DoE supercomputers including Frontier, Summit, and Perlmutter
 - **HDF5 VOL**: existing HDF5 applications can use ADIOS2 as a backend transparently via the HDF5 Virtual Object Layer
 
+## Fork addition: bbstage engine (not upstream)
+
+This fork adds **bbstage**, a write-only BP5 engine with node-local
+burst-buffer staging and asynchronous drain to the final store
+(`CloseMode=staged` returns `Close()` at the local dump; output remains
+standard BP5). See [BBSTAGE.md](BBSTAGE.md).
+
 ## Example
 
 ```python
