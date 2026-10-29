@@ -229,13 +229,26 @@ void BbstageWriter::InitParameters()
     {
         m_DeleteStagedFiles = (s == "true" || s == "on" || s == "1");
     }
-    if (helper::GetParameter(lower, "closemode", s))
+    // Environment variable fallbacks: bbstage is often reached through
+    // middleware (e.g. the WarpX checkpoint path via openPMD-api) where the
+    // application cannot pass engine parameters. Precedence: engine
+    // parameter > environment variable > built-in default.
+    std::string closeMode;
+    if (!helper::GetParameter(lower, "closemode", closeMode))
     {
-        if (s == "staged" || s == "async" || s == "stage")
+        std::string envCloseMode;
+        if (helper::GetEnv("BBSTAGE_CLOSE_MODE", envCloseMode))
+        {
+            closeMode = envCloseMode;
+        }
+    }
+    if (!closeMode.empty())
+    {
+        if (closeMode == "staged" || closeMode == "async" || closeMode == "stage")
         {
             m_CloseModeStaged = true;
         }
-        else if (s == "durable" || s == "default")
+        else if (closeMode == "durable" || closeMode == "default")
         {
             m_CloseModeStaged = false;
         }
@@ -243,21 +256,51 @@ void BbstageWriter::InitParameters()
         {
             helper::Throw<std::invalid_argument>("Engine", "BbstageWriter", "InitParameters",
                                                  "CloseMode must be 'durable' or 'staged', got '" +
-                                                     s + "'");
+                                                     closeMode + "'");
         }
     }
-    if (helper::GetParameter(lower, "stagingwatermarkmb", u))
+    uint64_t watermarkMB = 0;
+    bool haveWatermark = helper::GetParameter(lower, "stagingwatermarkmb", watermarkMB);
+    if (!haveWatermark)
     {
-        m_StagingWatermarkBytes = u * 1024ULL * 1024ULL;
+        std::string envWatermark;
+        if (helper::GetEnv("BBSTAGE_STAGING_WATERMARK_MB", envWatermark) &&
+            !envWatermark.empty())
+        {
+            char *end = nullptr;
+            const unsigned long long v = std::strtoull(envWatermark.c_str(), &end, 10);
+            if (end == envWatermark.c_str() || *end != '\0')
+            {
+                helper::Throw<std::invalid_argument>("Engine", "BbstageWriter", "InitParameters",
+                                                     "BBSTAGE_STAGING_WATERMARK_MB must be a "
+                                                     "non-negative integer, got '" +
+                                                         envWatermark + "'");
+            }
+            watermarkMB = v;
+            haveWatermark = true;
+        }
+    }
+    if (haveWatermark)
+    {
+        m_StagingWatermarkBytes = watermarkMB * 1024ULL * 1024ULL;
     }
 }
 
 void BbstageWriter::InitTransports()
 {
-    // TEMPORARY: open-phase profiling to diagnose multi-second Open on the
-    // test cluster. One line per rank to stderr; remove after diagnosis.
+    // Opt-in per-phase Open timing: BBSTAGE_TIMING=1 prints one line per
+    // phase per rank to stderr. Useful when diagnosing slow Open/Close on a
+    // system (e.g. the first deployment on a new machine); off by default so
+    // production application logs stay clean.
+    std::string timingEnv;
+    const bool doTiming = helper::GetEnv("BBSTAGE_TIMING", timingEnv) &&
+                          (timingEnv == "1" || timingEnv == "true" || timingEnv == "on");
     const auto tOpenStart = std::chrono::steady_clock::now();
-    const auto openPhase = [this, tOpenStart](const char *phase) {
+    const auto openPhase = [this, tOpenStart, doTiming](const char *phase) {
+        if (!doTiming)
+        {
+            return;
+        }
         const double ms = std::chrono::duration<double, std::milli>(
                               std::chrono::steady_clock::now() - tOpenStart)
                               .count();
@@ -1345,10 +1388,18 @@ void BbstageWriter::DoClose(const int /*transportIndex*/)
         return;
     }
 
-    // TEMPORARY: close-phase profiling; see the matching block in
-    // InitTransports. Remove after diagnosis.
+    // Opt-in per-phase Close timing; see the matching block in
+    // InitTransports (BBSTAGE_TIMING=1).
+    std::string timingEnvClose;
+    const bool doTimingClose =
+        helper::GetEnv("BBSTAGE_TIMING", timingEnvClose) &&
+        (timingEnvClose == "1" || timingEnvClose == "true" || timingEnvClose == "on");
     const auto tCloseStart = std::chrono::steady_clock::now();
-    const auto closePhase = [this, tCloseStart](const char *phase) {
+    const auto closePhase = [this, tCloseStart, doTimingClose](const char *phase) {
+        if (!doTimingClose)
+        {
+            return;
+        }
         const double ms = std::chrono::duration<double, std::milli>(
                               std::chrono::steady_clock::now() - tCloseStart)
                               .count();

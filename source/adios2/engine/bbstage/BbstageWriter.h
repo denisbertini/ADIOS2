@@ -108,6 +108,18 @@ namespace engine
  *                       bytes; EndStep() blocks above it so the node-local
  *                       burst buffer cannot fill (default 1024, 0 =
  *                       unlimited)
+ *
+ * Environment variables (fallbacks for when the engine is reached through
+ * middleware such as openPMD-api, which cannot pass engine parameters;
+ * precedence: engine parameter > environment variable > default):
+ *
+ *   BBSTAGE_CLOSE_MODE            "durable" or "staged" (CloseMode)
+ *   BBSTAGE_STAGING_WATERMARK_MB  watermark in MiB (StagingWatermarkMB)
+ *   BBSTAGE_TIMING                "1" enables per-phase Open/Close timing
+ *                                 lines on stderr (default: off)
+ *   TMPDIR                        burst buffer root when the
+ *                                 BurstBufferPath parameter is unset
+ *                                 (default /tmp)
  */
 class BbstageWriter : public BP5Engine, public core::Engine
 {

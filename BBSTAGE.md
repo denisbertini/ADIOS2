@@ -43,6 +43,12 @@ The output is **standard BP5**: read it back with the stock `bp5` engine,
 | `DrainThreads`     | `1`     | drain worker threads per rank                                                                    |
 | `CommitTimeoutSecs`| `300`   | give up waiting on a stuck peer rank after this long (0 = forever)                               |
 
+When bbstage is reached through middleware that cannot pass engine
+parameters (e.g. the WarpX checkpoint path via openPMD-api), these
+environment variables act as fallbacks (precedence: parameter > env var >
+default): `BBSTAGE_CLOSE_MODE`, `BBSTAGE_STAGING_WATERMARK_MB`,
+`BBSTAGE_TIMING` (=1: per-phase Open/Close timing lines on stderr).
+
 Full parameter list, protocol semantics, and limitations:
 [`docs/user_guide/source/engines/bbstage.rst`](docs/user_guide/source/engines/bbstage.rst).
 

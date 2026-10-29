@@ -112,6 +112,27 @@ bbstage-specific parameters:
 |                    |         | above it (0 = unlimited)                      |
 +--------------------+---------+-----------------------------------------------+
 
+Environment variables
+~~~~~~~~~~~~~~~~~~~~~
+
+When the engine is reached through middleware that cannot pass engine
+parameters (e.g. the WarpX checkpoint path via openPMD-api), the following
+environment variables act as fallbacks. Precedence: engine parameter >
+environment variable > default.
+
++--------------------------+---------------------------------------------+
+| Variable                 | Effect                                      |
++==========================+=============================================+
+| ``BBSTAGE_CLOSE_MODE``   | ``durable`` or ``staged`` (``CloseMode``)   |
++--------------------------+---------------------------------------------+
+| ``BBSTAGE_STAGING_WA-    | watermark in MiB                            |
+| TERMARK_MB``             | (``StagingWatermarkMB``)                    |
++--------------------------+---------------------------------------------+
+| ``BBSTAGE_TIMING``       | ``1`` prints one per-phase Open/Close       |
+|                          | timing line per rank to stderr (default:    |
+|                          | off)                                        |
++--------------------------+---------------------------------------------+
+
 Shared BP5 parameters are honored where they apply:
 ``BufferChunkSize``, ``InitialBufferSize``, ``GrowthFactor``, ``BufferVType``,
 ``StripeSize``, ``StatsLevel``, ``UseOneTimeAttributes``, ``FlattenSteps``,
