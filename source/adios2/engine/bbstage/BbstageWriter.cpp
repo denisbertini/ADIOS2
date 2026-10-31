@@ -30,6 +30,8 @@
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <unordered_map>
+#include <vector>
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -180,6 +182,14 @@ void BbstageWriter::Init()
         m_BurstBufferPath = m_Parameters.BurstBufferPath;
     }
 
+    // Aggregate mode: resolve the node topology (grouping, leader, per-node
+    // communicator) while MPI is alive. It must run before InitTransports,
+    // which opens the data sub-files based on the node grouping.
+    if (m_Aggregate)
+    {
+        SetupNodeTopology();
+    }
+
     InitTransports();
 }
 
@@ -284,6 +294,120 @@ void BbstageWriter::InitParameters()
     {
         m_StagingWatermarkBytes = watermarkMB * 1024ULL * 1024ULL;
     }
+    // Aggregate: node-aggregated drain (see the class documentation). Must be
+    // uniform across ranks: it drives MPI collectives at Open/EndStep.
+    std::string agg;
+    if (!helper::GetParameter(lower, "aggregate", agg))
+    {
+        std::string envAgg;
+        if (helper::GetEnv("BBSTAGE_AGGREGATE", envAgg) && !envAgg.empty())
+        {
+            agg = envAgg;
+        }
+    }
+    if (!agg.empty())
+    {
+        if (agg == "on" || agg == "true" || agg == "1")
+        {
+            m_Aggregate = true;
+        }
+        else if (agg == "off" || agg == "false" || agg == "0")
+        {
+            m_Aggregate = false;
+        }
+        else
+        {
+            helper::Throw<std::invalid_argument>("Engine", "BbstageWriter", "InitParameters",
+                                                  "Aggregate must be 'on' or 'off', got '" + agg + "'");
+        }
+    }
+}
+
+void BbstageWriter::SetupNodeTopology()
+{
+    const int W = m_Comm.Size();
+
+    // Single rank, or a non-MPI (serial) communicator: one node, this rank is
+    // its leader.
+    if (W <= 1 || !m_Comm.IsMPI())
+    {
+        m_NodeIndex = 0;
+        m_NodeLocalRank = 0;
+        m_NodeSize = 1;
+        m_NodeCount = 1;
+        m_IsLeader = true;
+        m_NodeMembers = {m_RankMPI};
+        m_NodeIndexPerRank.assign(1, 0);
+        return;
+    }
+
+    // Node identity key: SLURM_NODENAME when available, otherwise the
+    // hostname. Both are unique per physical node.
+    char myKey[256] = {0};
+    std::string slurmNode;
+    if (helper::GetEnv("SLURM_NODENAME", slurmNode) && !slurmNode.empty())
+    {
+        std::strncpy(myKey, slurmNode.c_str(), sizeof(myKey) - 1);
+    }
+    else
+    {
+        if (gethostname(myKey, sizeof(myKey) - 1) != 0)
+        {
+            std::strncpy(myKey, "unknown", sizeof(myKey) - 1);
+        }
+    }
+    myKey[sizeof(myKey) - 1] = '\0';
+
+    // Gather every rank's key to rank 0 (fixed-size char arrays).
+    std::vector<char> recvKeys;
+    if (m_RankMPI == 0)
+    {
+        recvKeys.resize(static_cast<size_t>(W) * sizeof(myKey));
+    }
+    m_Comm.GatherArrays(myKey, sizeof(myKey), recvKeys.data(), 0);
+
+    // Rank 0 assigns a compact node id (0..N-1) to each distinct key, in
+    // order of first appearance (i.e. by the lowest global rank on each node),
+    // and records every rank's node id.
+    std::vector<uint64_t> nodeIndexPerRank(W, 0);
+    if (m_RankMPI == 0)
+    {
+        std::unordered_map<std::string, int> keyToNode;
+        int nodeCount = 0;
+        for (int r = 0; r < W; ++r)
+        {
+            const std::string key(recvKeys.data() + static_cast<size_t>(r) * sizeof(myKey));
+            auto it = keyToNode.find(key);
+            int ni;
+            if (it == keyToNode.end())
+            {
+                ni = nodeCount++;
+                keyToNode.emplace(key, ni);
+            }
+            else
+            {
+                ni = it->second;
+            }
+            nodeIndexPerRank[r] = static_cast<uint64_t>(ni);
+        }
+        m_NodeCount = nodeCount;
+        m_NodeIndexPerRank = nodeIndexPerRank;
+    }
+
+    // Scatter each rank's node id back (one uint64 per rank) and broadcast the
+    // node count.
+    uint64_t myNodeIndex = 0;
+    m_Comm.Scatter(nodeIndexPerRank.data(), 1, &myNodeIndex, 1, 0);
+    m_NodeIndex = static_cast<int>(myNodeIndex);
+    m_NodeCount = m_Comm.BroadcastValue(m_NodeCount, 0);
+
+    // Per-node communicator: ranks sharing a node id, ordered by global rank,
+    // so local rank 0 is the node's lowest global rank (the leader).
+    m_NodeComm = m_Comm.Split(m_NodeIndex, m_RankMPI, "bbstage node communicator");
+    m_NodeLocalRank = m_NodeComm.Rank();
+    m_NodeSize = m_NodeComm.Size();
+    m_IsLeader = (m_NodeLocalRank == 0);
+    m_NodeMembers = m_NodeComm.AllGatherValues(m_RankMPI);
 }
 
 void BbstageWriter::InitTransports()
@@ -313,7 +437,11 @@ void BbstageWriter::InitTransports()
     const std::string mdFile = GetBPMetadataFileName(m_Name);
     const std::string mmdFile = GetBPMetaMetadataFileNames({m_Name})[0];
     const std::string mdIdxFile = GetBPMetadataIndexFileName(m_Name);
-    m_DataFileName = GetBPSubStreamName(m_Name, static_cast<size_t>(m_RankMPI));
+    // Aggregate mode: one data sub-file per node, named by the node id; the
+    // node leader is the only rank that writes it. Otherwise: one sub-file per
+    // writer rank (EveryoneWrites).
+    m_DataFileName = m_Aggregate ? GetBPSubStreamName(m_Name, static_cast<size_t>(m_NodeIndex))
+                                 : GetBPSubStreamName(m_Name, static_cast<size_t>(m_RankMPI));
 
     if (m_OpenMode == Mode::Write)
     {
@@ -321,7 +449,8 @@ void BbstageWriter::InitTransports()
         filesToKeep.push_back(std::filesystem::path(mdFile).filename().string());
         filesToKeep.push_back(std::filesystem::path(mmdFile).filename().string());
         filesToKeep.push_back(std::filesystem::path(mdIdxFile).filename().string());
-        for (int r = 0; r < m_Comm.Size(); ++r)
+        const int nSubFiles = m_Aggregate ? m_NodeCount : m_Comm.Size();
+        for (int r = 0; r < nSubFiles; ++r)
         {
             filesToKeep.push_back(
                 std::filesystem::path(GetBPSubStreamName(m_Name, static_cast<size_t>(r)))
@@ -347,11 +476,16 @@ void BbstageWriter::InitTransports()
     m_Comm.Barrier();
     openPhase("barrier1");
 
-    // final data sub-file: raw fd, only drain threads pwrite into it
-    m_DataFd = open(m_DataFileName.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
-    if (m_DataFd < 0)
+    // final data sub-file: raw fd, only drain threads pwrite into it. In
+    // aggregate mode the node leader is the only rank that opens it (it drains
+    // every rank on the node); non-leaders keep m_DataFd = -1.
+    if (!(m_Aggregate && !m_IsLeader))
     {
-        ThrowPosix("open of data sub-file " + m_DataFileName);
+        m_DataFd = open(m_DataFileName.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+        if (m_DataFd < 0)
+        {
+            ThrowPosix("open of data sub-file " + m_DataFileName);
+        }
     }
     openPhase("data-fd");
 
@@ -396,7 +530,10 @@ void BbstageWriter::InitTransports()
     // tail (observed 0.1-2 s on Lustre) dominated Open. The committer treats
     // a missing progress file as "progress 0", which is exactly the initial
     // state, so nothing depends on the file existing after Open.
-    m_ProgressPath = finalDir + "/bbstage.drain." + std::to_string(m_RankMPI);
+    // Aggregate mode: one progress record per node (bbstage.drain.<nodeId>),
+    // published by the node leader; otherwise one per writer rank.
+    const int progressId = m_Aggregate ? m_NodeIndex : m_RankMPI;
+    m_ProgressPath = finalDir + "/bbstage.drain." + std::to_string(progressId);
     openPhase("progress-file");
     m_MetaDataPos = 0; // BP5 md.0 carries no header in this format version
 
@@ -405,8 +542,15 @@ void BbstageWriter::InitTransports()
     if (m_CloseModeStaged)
     {
         // staged close: no per-instance drain workers; the process-level
-        // finalizer takes the session over at Close() and does the draining
-        BbstageStagedFinalizer::Instance().SetStagingWatermark(m_StagingWatermarkBytes);
+        // finalizer takes the session over at Close() and does the draining.
+        // Aggregate mode: the watermark is a per-node budget (the leader
+        // tracks the node's total staged-but-undrained bytes), so scale the
+        // per-rank setting by the number of ranks on this node.
+        const uint64_t watermark = m_Aggregate
+                                       ? m_StagingWatermarkBytes *
+                                             static_cast<uint64_t>(m_NodeSize > 0 ? m_NodeSize : 1)
+                                       : m_StagingWatermarkBytes;
+        BbstageStagedFinalizer::Instance().SetStagingWatermark(watermark);
     }
     else
     {
@@ -476,26 +620,67 @@ void BbstageWriter::EndStep()
 
     const size_t dataSize = TSInfo.DataBuffer->Size();
 
-    // Pre-assign the step's position in the final data sub-file. Because each
-    // rank owns its sub-file and drains FIFO, offsets assigned here are final,
-    // exactly like BP5's EveryoneWrites mode.
-    uint64_t finalPos = m_DataPos;
-    if (m_Parameters.StripeSize > 1)
-    {
-        finalPos += helper::PaddingToAlignOffset(finalPos, m_Parameters.StripeSize);
-    }
+    uint64_t finalPos = 0;
+    uint64_t nodeFilePos = 0;         // aggregate: this step's aligned node-file base
+    std::vector<uint64_t> nodeSizes;  // aggregate: per-rank sizes, node-local rank order
 
-    // staged close: backpressure. If the application stages faster than the
-    // background drain keeps up, block here so the node-local burst buffer
-    // cannot fill. (Durable mode needs no such guard: the instance's own
-    // drain workers run concurrently and Close() waits for them anyway.)
-    if (m_CloseModeStaged)
+    if (m_Aggregate)
     {
-        BbstageStagedFinalizer::Instance().AccountStaged(dataSize);
+        // The node leader holds the node data sub-file's append position.
+        // Align it and broadcast it to the node: every rank derives its own
+        // intra-node offset from it, so the offsets are final at staging time
+        // and the drain stays a pure byte copy (the bbstage invariant).
+        nodeFilePos = m_DataPos;
+        if (m_Parameters.StripeSize > 1)
+        {
+            nodeFilePos += helper::PaddingToAlignOffset(nodeFilePos, m_Parameters.StripeSize);
+        }
+        m_NodeComm.Bcast(&nodeFilePos, 1, 0);
+        // Each rank contributes its step size; the node file lays the slices
+        // out in global-rank order (== node-local rank order).
+        nodeSizes.resize(static_cast<size_t>(m_NodeSize));
+        const uint64_t mySize = dataSize;
+        m_NodeComm.Allgather(&mySize, 1, nodeSizes.data(), 1);
+        uint64_t prefix = 0;
+        for (int l = 0; l < m_NodeSize; ++l)
+        {
+            if (l == m_NodeLocalRank)
+            {
+                finalPos = nodeFilePos + prefix;
+            }
+            prefix += nodeSizes[static_cast<size_t>(l)];
+        }
+        if (m_IsLeader)
+        {
+            m_DataPos = nodeFilePos + prefix; // prefix == this step's node total
+            // Backpressure: the leader gates the whole node (its drain jobs
+            // carry the node total); non-leaders rely on that gate (step
+            // progression is collective). Durable mode needs no such guard.
+            if (m_CloseModeStaged)
+            {
+                BbstageStagedFinalizer::Instance().AccountStaged(prefix);
+            }
+        }
+    }
+    else
+    {
+        // EveryoneWrites: each rank owns its sub-file and drains FIFO, so the
+        // offset assigned here is final.
+        finalPos = m_DataPos;
+        if (m_Parameters.StripeSize > 1)
+        {
+            finalPos += helper::PaddingToAlignOffset(finalPos, m_Parameters.StripeSize);
+        }
+        // staged close: backpressure (per-rank). Durable mode needs no guard.
+        if (m_CloseModeStaged)
+        {
+            BbstageStagedFinalizer::Instance().AccountStaged(dataSize);
+        }
     }
 
     // Synchronous spill of the step payload to node-local SSD: the bbstage
     // critical path. Cheap, contiguous, local; memory is freed immediately.
+    // (Unchanged by aggregate mode: everyone still stages its own file.)
     const std::string stagingPath = m_StagingDir + "/step_r" + std::to_string(m_RankMPI) + "_" +
                                     std::to_string(m_WriterStep);
     {
@@ -515,10 +700,52 @@ void BbstageWriter::EndStep()
     delete TSInfo.DataBuffer;
     TSInfo.DataBuffer = nullptr;
 
-    m_DataPos = finalPos + dataSize;
+    // Aggregate: the node leader's drain worker reads every rank's staging
+    // file, so all of them must be written before the job is handed off. This
+    // node-local barrier guarantees that (everyone on the node calls it).
+    if (m_Aggregate)
+    {
+        m_NodeComm.Barrier();
+    }
 
-    // hand off to the in-process drain workers (original bbview: xattr +
-    // socket message to bbviewd)
+    if (!m_Aggregate)
+    {
+        m_DataPos = finalPos + dataSize;
+    }
+
+    // Hand off to the in-process drain workers (original bbview: xattr +
+    // socket message to bbviewd).
+    if (m_Aggregate)
+    {
+        // Only the leader enqueues: one job that drains every rank on the node
+        // into the shared node sub-file. Non-leaders stage locally and let the
+        // leader drain their files.
+        if (m_IsLeader)
+        {
+            DrainJob job;
+            job.Seq = m_NextDataSeq++;
+            job.Step = m_WriterStep;
+            uint64_t prefix = 0;
+            for (int l = 0; l < m_NodeSize; ++l)
+            {
+                BbstageDrainMember mem;
+                mem.StagingPath = m_StagingDir + "/step_r" +
+                                  std::to_string(m_NodeMembers[static_cast<size_t>(l)]) + "_" +
+                                  std::to_string(m_WriterStep);
+                mem.FinalPos = nodeFilePos + prefix;
+                mem.DataSize = nodeSizes[static_cast<size_t>(l)];
+                prefix += nodeSizes[static_cast<size_t>(l)];
+                job.Members.push_back(std::move(mem));
+            }
+            job.DataSize = prefix; // node total (drain watermark / progress)
+            {
+                std::lock_guard<std::mutex> lck(m_Mutex);
+                m_DataQueue.push_back(std::move(job));
+            }
+            m_DataCV.notify_one();
+        }
+    }
+    else
     {
         DrainJob job;
         job.Seq = m_NextDataSeq++;
@@ -575,9 +802,14 @@ void BbstageWriter::NotifyEngineAttribute(std::string /*name*/, AttributeBase *A
 
 void BbstageWriter::StartDrainThreads()
 {
-    for (unsigned int i = 0; i < m_DrainThreads; ++i)
+    // Aggregate mode: only the node leader drains (it copies every rank on the
+    // node); non-leaders have no data to drain, so they start no workers.
+    if (!(m_Aggregate && !m_IsLeader))
     {
-        m_DrainWorkers.emplace_back(&BbstageWriter::WorkerLoop, this);
+        for (unsigned int i = 0; i < m_DrainThreads; ++i)
+        {
+            m_DrainWorkers.emplace_back(&BbstageWriter::WorkerLoop, this);
+        }
     }
     if (m_RankMPI == 0)
     {
@@ -688,48 +920,67 @@ void BbstageWriter::WorkerLoop()
 
 void BbstageWriter::RunDataJob(DrainJob &job)
 {
-    const int sfd = open(job.StagingPath.c_str(), O_RDONLY | O_CLOEXEC);
-    if (sfd < 0)
-    {
-        ThrowPosix("open staging file for drain " + job.StagingPath);
-    }
-    std::vector<char> buf(DrainCopyBufferSize);
-    size_t remain = job.DataSize;
-    uint64_t inOff = 0;
-    uint64_t outOff = job.FinalPos;
-    while (remain > 0)
-    {
-        const size_t want = std::min(remain, buf.size());
-        ssize_t n = 0;
-        do
+    // Copy one staging file into the (node) data sub-file at its final offset.
+    // In aggregate mode the leader calls this once per node member; otherwise
+    // once for this rank's own slice.
+    auto drainOne = [this](const std::string &stagingPath, uint64_t finalPos, size_t dataSize) {
+        const int sfd = open(stagingPath.c_str(), O_RDONLY | O_CLOEXEC);
+        if (sfd < 0)
         {
-            n = pread(sfd, buf.data(), want, static_cast<off_t>(inOff));
-        } while (n < 0 && errno == EINTR);
-        if (n <= 0)
-        {
-            close(sfd);
-            helper::Throw<std::runtime_error>("Engine", "BbstageWriter", "RunDataJob",
-                                              "short read of staging file " + job.StagingPath +
-                                                  " at " + std::to_string(inOff) + " (" +
-                                                  std::to_string(remain) + " bytes still due)");
+            ThrowPosix("open staging file for drain " + stagingPath);
         }
-        PwriteBuffer(m_DataFd, buf.data(), static_cast<size_t>(n), outOff);
-        inOff += static_cast<uint64_t>(n);
-        outOff += static_cast<uint64_t>(n);
-        remain -= static_cast<size_t>(n);
-    }
-    close(sfd);
+        std::vector<char> buf(DrainCopyBufferSize);
+        size_t remain = dataSize;
+        uint64_t inOff = 0;
+        uint64_t outOff = finalPos;
+        while (remain > 0)
+        {
+            const size_t want = std::min(remain, buf.size());
+            ssize_t n = 0;
+            do
+            {
+                n = pread(sfd, buf.data(), want, static_cast<off_t>(inOff));
+            } while (n < 0 && errno == EINTR);
+            if (n <= 0)
+            {
+                close(sfd);
+                helper::Throw<std::runtime_error>("Engine", "BbstageWriter", "RunDataJob",
+                                                  "short read of staging file " + stagingPath +
+                                                      " at " + std::to_string(inOff) + " (" +
+                                                          std::to_string(remain) +
+                                                              " bytes still due)");
+            }
+            PwriteBuffer(m_DataFd, buf.data(), static_cast<size_t>(n), outOff);
+            inOff += static_cast<uint64_t>(n);
+            outOff += static_cast<uint64_t>(n);
+            remain -= static_cast<size_t>(n);
+        }
+        close(sfd);
 
-    if (m_DeleteStagedFiles)
+        if (m_DeleteStagedFiles)
+        {
+            std::error_code ec;
+            std::filesystem::remove(stagingPath, ec); // best effort
+        }
+    };
+
+    if (!job.Members.empty())
     {
-        std::error_code ec;
-        std::filesystem::remove(job.StagingPath, ec); // best effort
+        for (auto &mem : job.Members)
+        {
+            drainOne(mem.StagingPath, mem.FinalPos, mem.DataSize);
+        }
+    }
+    else
+    {
+        drainOne(job.StagingPath, job.FinalPos, job.DataSize);
     }
 
     if (m_Parameters.verbose > 2)
     {
+        const size_t nSlices = job.Members.empty() ? 1 : job.Members.size();
         std::cout << "bbstage rank " << m_RankMPI << " drained step " << job.Step << " ("
-                  << job.DataSize << " bytes -> " << job.FinalPos << ")\n";
+                  << job.DataSize << " bytes, " << nSlices << " slice(s))\n";
     }
 }
 
@@ -844,8 +1095,11 @@ void BbstageWriter::WaitForAllRanksDrained(size_t step)
         std::this_thread::sleep_for(poll);
     }
 
-    // remote ranks via their atomically-updated progress files
-    const int size = m_Comm.Size();
+    // remote peers via their atomically-updated progress files. Aggregate
+    // mode: one progress record per node (bbstage.drain.<nodeId>), so gate on
+    // the other nodes; otherwise one per writer rank. This rank (0) is always
+    // its node's leader, so its own node is covered by the in-memory check above.
+    const int size = m_Aggregate ? m_NodeCount : m_Comm.Size();
     for (int r = 1; r < size; ++r)
     {
         const std::string path = m_Name + "/bbstage.drain." + std::to_string(r);
@@ -1180,19 +1434,23 @@ void BbstageWriter::WriteIndexHeaderAndWriterMap()
     const uint64_t W = static_cast<uint64_t>(m_Comm.Size());
     // payload: length field + WriterCount + AggregatorCount + SubStreams + W map
     // entries (the record's length value counts 3+W payload uint64s, matching
-    // BP5Writer::WriteMetadataFileIndex)
+    // BP5Writer::WriteMetadataFileIndex). Aggregate mode routes every writer to
+    // its node's sub-file (SubStreams = node count); otherwise each writer maps
+    // to its own sub-file (EveryoneWrites).
+    const uint64_t subStreams = m_Aggregate ? static_cast<uint64_t>(m_NodeCount) : W;
     const size_t recSize = 1 + (4 + W) * sizeof(uint64_t);
     buf.resize(buf.size() + recSize);
     const unsigned char record = static_cast<unsigned char>(WriterMapRecord);
     helper::CopyToBuffer(buf, pos, &record, 1);
     uint64_t d = (3 + W) * sizeof(uint64_t);
     helper::CopyToBuffer(buf, pos, &d);
-    helper::CopyToBuffer(buf, pos, &W);          // WriterCount
-    helper::CopyToBuffer(buf, pos, &W);          // AggregatorCount == writers
-    helper::CopyToBuffer(buf, pos, &W);          // SubStreams == writers
+    helper::CopyToBuffer(buf, pos, &W);              // WriterCount
+    helper::CopyToBuffer(buf, pos, &W);              // AggregatorCount == writers
+    helper::CopyToBuffer(buf, pos, &subStreams);     // SubStreams
     for (uint64_t w = 0; w < W; ++w)
     {
-        helper::CopyToBuffer(buf, pos, &w); // writer w -> sub-file w
+        const uint64_t sub = m_Aggregate ? m_NodeIndexPerRank[w] : w;
+        helper::CopyToBuffer(buf, pos, &sub); // writer w -> sub-file
     }
     m_MDIndexFile->Write(buf.data(), buf.size());
     m_MDIndexFile->Flush();
@@ -1429,6 +1687,8 @@ void BbstageWriter::DoClose(const int /*transportIndex*/)
         session.Rank = m_RankMPI;
         session.WriterCount = m_Comm.Size();
         session.Verbose = m_Parameters.verbose;
+        session.Aggregate = m_Aggregate;
+        session.NodeCount = m_NodeCount;
         session.DataFd = m_DataFd;
         m_DataFd = -1;
         session.ProgressFd = m_ProgressFd;

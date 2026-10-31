@@ -70,7 +70,11 @@ namespace engine
  *
  * Output layout is standard BP5 (data.<rank> sub-files, one per writer, plus
  * md.0/md.idx/mmd.0 written by rank 0), so output is readable by stock ADIOS2
- * readers once steps are committed (all steps at Close()).
+ * readers once steps are committed (all steps at Close()). With Aggregate=on
+ * the data sub-files are data.<node> (one per node, written by the node
+ * leader) and the writer map routes every rank to its node's sub-file; the
+ * output is still stock-BP5 readable (the same layout BP5's TwoLevelShm
+ * aggregation produces).
  *
  * Reads: use engine "bp5" (this engine registers BP5Reader as its read side).
  * Direct reads of steps still sitting in the local-SSD burst buffer
@@ -107,7 +111,22 @@ namespace engine
  *   StagingWatermarkMB  staged mode: per-rank cap on staged-but-undrained
  *                       bytes; EndStep() blocks above it so the node-local
  *                       burst buffer cannot fill (default 1024, 0 =
- *                       unlimited)
+ *                       unlimited). In Aggregate mode the cap applies to the
+ *                       whole node: the effective node budget is
+ *                       StagingWatermarkMB times the number of ranks on the
+ *                       node, tracked as the node's total staged-but-undrained
+ *                       bytes.
+ *   Aggregate           "on"/"off" (default "off"). "on": node-aggregated
+ *                       drain. Local staging stays per-rank (unchanged
+ *                       critical path), but the SSD -> final-store drain is
+ *                       aggregated per node: each node's leader rank copies
+ *                       every rank's local staging files into a single
+ *                       data.<node> sub-file on the final store. The number
+ *                       of data sub-files (and drain progress records) scales
+ *                       with the node count instead of the rank count, which
+ *                       matters for the metadata servers and for readers on
+ *                       very large jobs. Off critical path: aggregation runs
+ *                       in the existing background drain workers.
  *
  * Environment variables (fallbacks for when the engine is reached through
  * middleware such as openPMD-api, which cannot pass engine parameters;
@@ -115,6 +134,7 @@ namespace engine
  *
  *   BBSTAGE_CLOSE_MODE            "durable" or "staged" (CloseMode)
  *   BBSTAGE_STAGING_WATERMARK_MB  watermark in MiB (StagingWatermarkMB)
+ *   BBSTAGE_AGGREGATE             "on"/"off" (Aggregate)
  *   BBSTAGE_TIMING                "1" enables per-phase Open/Close timing
  *                                 lines on stderr (default: off)
  *   TMPDIR                        burst buffer root when the
@@ -173,6 +193,11 @@ private:
                       const bool isActive);
     void WriteIndexHeaderAndWriterMap();
 
+    // Aggregate mode: node topology, resolved once at Open while MPI is alive
+    // (per-step offsets and the per-node drain jobs are then derived locally,
+    // so nothing after the Close hand-off needs MPI).
+    void SetupNodeTopology();
+
     // bbstage-specific parameters
     unsigned int m_DrainThreads = 1;
     bool m_StagingSync = false;
@@ -182,6 +207,17 @@ private:
     bool m_DeleteStagedFiles = true;
     bool m_CloseModeStaged = false;                 // CloseMode=staged
     uint64_t m_StagingWatermarkBytes = 1024ULL << 20; // StagingWatermarkMB (0 = unlimited)
+    bool m_Aggregate = false;                        // Aggregate=on
+
+    // Aggregate-mode node topology (valid when m_Aggregate is true)
+    helper::Comm m_NodeComm;        // per-node communicator (split of m_Comm)
+    int m_NodeIndex = 0;            // compact node id 0..NodeCount-1 (sub-file + progress id)
+    int m_NodeLocalRank = 0;        // rank within the node, ordered by global rank
+    int m_NodeSize = 1;             // ranks on this node
+    int m_NodeCount = 1;            // total nodes (known on every rank)
+    bool m_IsLeader = false;        // m_NodeLocalRank == 0: drains the node
+    std::vector<int> m_NodeMembers; // global ranks on this node, ordered by global rank
+    std::vector<uint64_t> m_NodeIndexPerRank; // rank 0: node id per writer (WriterMap)
 
     format::BP5Serializer m_BP5Serializer;
 

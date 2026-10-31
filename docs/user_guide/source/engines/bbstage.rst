@@ -45,6 +45,17 @@ The engine implements this contract fully in-process:
     ``bp5`` engine -- both after ``Close()`` and, for streaming readers, step
     by step as steps commit. A reader can never observe a step whose data has
     not landed on the final store.
+  - With ``Aggregate=on`` the data sub-files are ``data.<node>`` (one per
+    node, written by the node's leader rank) and the writer map routes every
+    rank to its node's sub-file. The output remains a standard BP5 stream
+    readable by the stock ``bp5`` engine (the same layout BP5's TwoLevelShm
+    aggregation produces), but the number of data sub-files -- and with it the
+    load on the parallel store's metadata servers and the readers' file count
+    -- scales with the **node count** instead of the rank count. This is the
+    right lever for very large jobs (e.g. thousands of ranks), where one
+    sub-file per rank would be a metadata explosion; the SSD -> final-store
+    drain is what gets aggregated, so the app-visible staging path is
+    unchanged.
   - In ``durable`` mode (default), ``Flush()`` and ``Close()`` are the
     durability points: they block until all steps are drained and committed.
   - In ``staged`` mode (``CloseMode=staged``), ``Close()`` returns as soon as
@@ -107,9 +118,24 @@ bbstage-specific parameters:
 |                    |         | commit run in the background, finalized at a  |
 |                    |         | clean exit (see above)                        |
 +--------------------+---------+-----------------------------------------------+
-| StagingWatermarkMB | 1024    | staged mode: per-rank cap on staged-but-      |
-|                    |         | undrained bytes (MiB); ``EndStep`` blocks     |
-|                    |         | above it (0 = unlimited)                      |
+| StagingWatermarkMB | 1024    | staged mode: cap on staged-but-undrained      |
+|                    |         | bytes (MiB); ``EndStep`` blocks above it      |
+|                    |         | (0 = unlimited). Per rank, or per node (the    |
+|                    |         | value times the ranks per node) when          |
+|                    |         | ``Aggregate`` is on                           |
++--------------------+---------+-----------------------------------------------+
+| Aggregate          | off     | ``on``: node-aggregated drain. Local staging   |
+|                    |         | stays per-rank (unchanged critical path), but  |
+|                    |         | the SSD -> final-store drain is aggregated per |
+|                    |         | node: each node's leader rank copies every     |
+|                    |         | rank's local staging files into a single       |
+|                    |         | ``data.<node>`` sub-file. The number of data   |
+|                    |         | sub-files (and drain progress records) scales  |
+|                    |         | with the node count instead of the rank count, |
+|                    |         | which matters for the metadata servers and for |
+|                    |         | readers on very large jobs. Off critical path: |
+|                    |         | aggregation runs in the existing background    |
+|                    |         | drain workers. Must be uniform across ranks    |
 +--------------------+---------+-----------------------------------------------+
 
 Environment variables
@@ -131,6 +157,8 @@ environment variable > default.
 | ``BBSTAGE_TIMING``       | ``1`` prints one per-phase Open/Close       |
 |                          | timing line per rank to stderr (default:    |
 |                          | off)                                        |
++--------------------------+---------------------------------------------+
+| ``BBSTAGE_AGGREGATE``    | ``on``/``off`` (``Aggregate``)              |
 +--------------------------+---------------------------------------------+
 
 Shared BP5 parameters are honored where they apply:

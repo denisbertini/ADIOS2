@@ -69,6 +69,11 @@ public:
         int Rank = 0;
         int WriterCount = 1;
         int Verbose = 0;
+        // Aggregate mode: node-aggregated drain. The session's DataQueue holds
+        // node jobs (Members) on the leader and is empty on non-leaders; the
+        // committer (rank 0) gates on one progress record per node.
+        bool Aggregate = false;
+        int NodeCount = 1;
 
         // handed-over resources (ownership transfers on registration)
         int DataFd = -1;

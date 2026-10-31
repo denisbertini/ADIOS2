@@ -175,47 +175,65 @@ BbstageStagedFinalizer::~BbstageStagedFinalizer()
 
 void BbstageStagedFinalizer::RunDataJob(Session &s, BbstageDrainJob &job)
 {
-    const int sfd = open(job.StagingPath.c_str(), O_RDONLY | O_CLOEXEC);
-    if (sfd < 0)
-    {
-        ThrowPosix("open staging file for drain " + job.StagingPath);
-    }
-    std::vector<char> buf(DrainCopyBufferSize);
-    size_t remain = job.DataSize;
-    uint64_t inOff = 0;
-    uint64_t outOff = job.FinalPos;
-    while (remain > 0)
-    {
-        const size_t want = std::min(remain, buf.size());
-        ssize_t n = 0;
-        do
+    // Copy one staging file into the (node) data sub-file at its final offset.
+    // Aggregate mode: the leader calls this once per node member; otherwise
+    // once for this rank's own slice.
+    auto drainOne = [&](const std::string &stagingPath, uint64_t finalPos, size_t dataSize) {
+        const int sfd = open(stagingPath.c_str(), O_RDONLY | O_CLOEXEC);
+        if (sfd < 0)
         {
-            n = pread(sfd, buf.data(), want, static_cast<off_t>(inOff));
-        } while (n < 0 && errno == EINTR);
-        if (n <= 0)
-        {
-            close(sfd);
-            throw std::runtime_error("bbstage finalizer: short read of staging file " +
-                                     job.StagingPath + " at " + std::to_string(inOff) + " (" +
-                                     std::to_string(remain) + " bytes still due)");
+            ThrowPosix("open staging file for drain " + stagingPath);
         }
-        PwriteAll(s.DataFd, buf.data(), static_cast<size_t>(n), outOff);
-        inOff += static_cast<uint64_t>(n);
-        outOff += static_cast<uint64_t>(n);
-        remain -= static_cast<size_t>(n);
-    }
-    close(sfd);
+        std::vector<char> buf(DrainCopyBufferSize);
+        size_t remain = dataSize;
+        uint64_t inOff = 0;
+        uint64_t outOff = finalPos;
+        while (remain > 0)
+        {
+            const size_t want = std::min(remain, buf.size());
+            ssize_t n = 0;
+            do
+            {
+                n = pread(sfd, buf.data(), want, static_cast<off_t>(inOff));
+            } while (n < 0 && errno == EINTR);
+            if (n <= 0)
+            {
+                close(sfd);
+                throw std::runtime_error("bbstage finalizer: short read of staging file " +
+                                         stagingPath + " at " + std::to_string(inOff) + " (" +
+                                         std::to_string(remain) + " bytes still due)");
+            }
+            PwriteAll(s.DataFd, buf.data(), static_cast<size_t>(n), outOff);
+            inOff += static_cast<uint64_t>(n);
+            outOff += static_cast<uint64_t>(n);
+            remain -= static_cast<size_t>(n);
+        }
+        close(sfd);
 
-    if (s.DeleteStagedFiles)
+        if (s.DeleteStagedFiles)
+        {
+            std::error_code ec;
+            std::filesystem::remove(stagingPath, ec); // best effort
+        }
+    };
+
+    if (!job.Members.empty())
     {
-        std::error_code ec;
-        std::filesystem::remove(job.StagingPath, ec); // best effort
+        for (auto &mem : job.Members)
+        {
+            drainOne(mem.StagingPath, mem.FinalPos, mem.DataSize);
+        }
+    }
+    else
+    {
+        drainOne(job.StagingPath, job.FinalPos, job.DataSize);
     }
 
     if (s.Verbose > 2)
     {
+        const size_t nSlices = job.Members.empty() ? 1 : job.Members.size();
         std::cout << "bbstage finalizer rank " << s.Rank << " drained step " << job.Step
-                  << " (" << job.DataSize << " bytes -> " << job.FinalPos << ") of " << s.FinalDir
+                  << " (" << job.DataSize << " bytes, " << nSlices << " slice(s)) of " << s.FinalDir
                   << "\n";
     }
 }
@@ -449,9 +467,13 @@ void BbstageStagedFinalizer::WaitForSessionDrained(Session &s, size_t step)
         std::this_thread::sleep_for(poll);
     }
 
-    // remote ranks via their atomically-updated progress files (the committer
-    // only exists on rank 0, so ranks 1..WriterCount-1 are the peers)
-    for (int r = 1; r < s.WriterCount; ++r)
+    // remote peers via their atomically-updated progress files (the committer
+    // only exists on rank 0, so ranks 1..WriterCount-1 are the peers). Aggregate
+    // mode: one progress record per node, so gate on the other nodes. Rank 0 is
+    // always its node's leader, so its own node is covered by the in-memory
+    // check above.
+    const int peers = s.Aggregate ? s.NodeCount : s.WriterCount;
+    for (int r = 1; r < peers; ++r)
     {
         const std::string path = s.FinalDir + "/bbstage.drain." + std::to_string(r);
         for (;;)
@@ -506,9 +528,11 @@ void BbstageStagedFinalizer::FinalizeSession(Session &s)
     s.MDIndexFile = nullptr;
 
     // all commits of this session are done: the progress files are no longer
-    // needed by anyone (the committer only reads them while gating commits)
+    // needed by anyone (the committer only reads them while gating commits).
+    // Aggregate mode: one per node; otherwise one per writer rank.
     std::error_code ec;
-    for (int r = 0; r < s.WriterCount; ++r)
+    const int nProgress = s.Aggregate ? s.NodeCount : s.WriterCount;
+    for (int r = 0; r < nProgress; ++r)
     {
         std::filesystem::remove(s.FinalDir + "/bbstage.drain." + std::to_string(r), ec);
     }

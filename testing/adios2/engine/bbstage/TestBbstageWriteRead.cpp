@@ -11,9 +11,11 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <filesystem>
 #include <numeric>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace
@@ -231,6 +233,167 @@ TEST_F(EngineBbstage, StreamingReadSeesOnlyDrainedSteps)
     writer.Close();
     EXPECT_EQ(reader.BeginStep(), adios2::StepStatus::EndOfStream);
     reader.Close();
+}
+
+// Aggregate drain (Aggregate=on): local staging stays per-rank, but the
+// SSD -> final-store drain is aggregated per node into a single data.<node>
+// sub-file. On a single node (the usual test case) that is one data file for
+// all ranks instead of one per rank. The stock bp5 reader follows the writer
+// map to the node sub-file and must read back byte-identical data.
+TEST_F(EngineBbstage, AggregateDrainReadBackBP5)
+{
+    constexpr size_t n = 100;
+    constexpr int nSteps = 3;
+    const int rank = MpiRank();
+    const int size = MpiSize();
+    const size_t globalN = n * static_cast<size_t>(size);
+
+    {
+        adios2::IO io = m_Adios.DeclareIO("bbstage-agg-writer");
+        io.SetEngine("bbstage");
+        io.SetParameters({{"BurstBufferPath", StagingDir}, {"Aggregate", "on"},
+                          {"verbose", "0"}});
+
+        // each rank owns a disjoint block of the global array
+        auto gvar = io.DefineVariable<float>("gdata", {globalN},
+                                             {static_cast<size_t>(rank) * n}, {n});
+        io.DefineAttribute<std::string>("written_by", "bbstage-agg-engine");
+
+        adios2::Engine engine = io.Open(TestName, adios2::Mode::Write);
+        for (int s = 0; s < nSteps; ++s)
+        {
+            auto v = MakeStep(s, n);
+            engine.BeginStep();
+            engine.Put<float>(gvar, v.data());
+            engine.EndStep();
+        }
+        engine.Close();
+    }
+#if ADIOS2_USE_MPI
+    MPI_Barrier(MPI_COMM_WORLD); // every writer must be done before inspection
+#endif
+
+    // Layout: with Aggregate=on the data sub-files are data.<node>, one per
+    // node, so there must be at most one per rank (fewer when ranks share a
+    // node). No drain progress files may be left behind.
+    {
+        ASSERT_TRUE(std::filesystem::exists(TestName));
+        ASSERT_TRUE(std::filesystem::exists(std::filesystem::path(TestName) / "md.idx"));
+        int dataFileCount = 0;
+        for (const auto &e : std::filesystem::directory_iterator(TestName))
+        {
+            const std::string fn = e.path().filename().string();
+            EXPECT_EQ(fn.rfind("bbstage.drain.", 0), std::string::npos)
+                << "stale drain progress file: " << e.path();
+            if (fn.rfind("data.", 0) == 0)
+            {
+                ++dataFileCount;
+            }
+        }
+        EXPECT_GE(dataFileCount, 1) << "no data sub-file found";
+        EXPECT_LE(dataFileCount, size) << "more data sub-files than ranks: " << dataFileCount;
+    }
+
+    // Read back with the stock bp5 engine; must be byte-identical to the
+    // non-aggregated layout.
+    {
+        adios2::IO io = m_Adios.DeclareIO("bp5-reader-agg");
+        io.SetEngine("bp5");
+        adios2::Engine reader = io.Open(TestName, adios2::Mode::ReadRandomAccess);
+        EXPECT_EQ(reader.Steps(), static_cast<size_t>(nSteps));
+        auto gvar = io.InquireVariable<float>("gdata");
+        ASSERT_TRUE(static_cast<bool>(gvar));
+        auto attr = io.InquireAttribute<std::string>("written_by");
+        ASSERT_TRUE(static_cast<bool>(attr));
+        EXPECT_EQ(attr.Data()[0], "bbstage-agg-engine");
+
+        for (size_t s = 0; s < static_cast<size_t>(nSteps); ++s)
+        {
+            auto expected = MakeGlobalStep(s, n, size);
+            std::vector<float> got(globalN);
+            gvar.SetStepSelection({s, 1});
+            gvar.SetSelection({{0}, {globalN}});
+            reader.Get<float>(gvar, got.data(), adios2::Mode::Sync);
+            EXPECT_EQ(got, expected) << "step " << s;
+        }
+        reader.Close();
+    }
+}
+
+// Staged close + aggregate: the app-visible cost ends at the node-local SSD
+// write; the node leader then drains the aggregated data and commits the
+// metadata in the process background. Poll the bbstage.final marker (the
+// durability/visibility point), then read back with the stock bp5 engine.
+TEST_F(EngineBbstage, StagedAggregateDrainReadBackBP5)
+{
+    constexpr size_t n = 100;
+    constexpr int nSteps = 3;
+    const int rank = MpiRank();
+    const int size = MpiSize();
+    const size_t globalN = n * static_cast<size_t>(size);
+
+    {
+        adios2::IO io = m_Adios.DeclareIO("bbstage-agg-staged-writer");
+        io.SetEngine("bbstage");
+        io.SetParameters({{"BurstBufferPath", StagingDir}, {"Aggregate", "on"},
+                          {"CloseMode", "staged"}});
+
+        auto gvar = io.DefineVariable<float>("gdata", {globalN},
+                                             {static_cast<size_t>(rank) * n}, {n});
+        io.DefineAttribute<std::string>("written_by", "bbstage-agg-staged");
+
+        adios2::Engine engine = io.Open(TestName, adios2::Mode::Write);
+        for (int s = 0; s < nSteps; ++s)
+        {
+            auto v = MakeStep(s, n);
+            engine.BeginStep();
+            engine.Put<float>(gvar, v.data());
+            engine.EndStep();
+        }
+        engine.Close(); // returns as soon as the step is staged to node-local SSD
+    }
+#if ADIOS2_USE_MPI
+    MPI_Barrier(MPI_COMM_WORLD);
+#endif
+
+    // Wait for the background finalizer to drain, commit, and publish the
+    // durability marker.
+    {
+        const std::string fin = (std::filesystem::path(TestName) / "bbstage.final").string();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        while (!std::filesystem::exists(fin))
+        {
+            if (std::chrono::steady_clock::now() > deadline)
+            {
+                FAIL() << "timed out waiting for the bbstage.final marker of " << TestName;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+
+    // Read back with the stock bp5 engine; must be byte-identical.
+    {
+        adios2::IO io = m_Adios.DeclareIO("bp5-reader-agg-staged");
+        io.SetEngine("bp5");
+        adios2::Engine reader = io.Open(TestName, adios2::Mode::ReadRandomAccess);
+        EXPECT_EQ(reader.Steps(), static_cast<size_t>(nSteps));
+        auto gvar = io.InquireVariable<float>("gdata");
+        ASSERT_TRUE(static_cast<bool>(gvar));
+        auto attr = io.InquireAttribute<std::string>("written_by");
+        ASSERT_TRUE(static_cast<bool>(attr));
+        EXPECT_EQ(attr.Data()[0], "bbstage-agg-staged");
+
+        for (size_t s = 0; s < static_cast<size_t>(nSteps); ++s)
+        {
+            auto expected = MakeGlobalStep(s, n, size);
+            std::vector<float> got(globalN);
+            gvar.SetStepSelection({s, 1});
+            gvar.SetSelection({{0}, {globalN}});
+            reader.Get<float>(gvar, got.data(), adios2::Mode::Sync);
+            EXPECT_EQ(got, expected) << "step " << s;
+        }
+        reader.Close();
+    }
 }
 
 int main(int argc, char **argv)
