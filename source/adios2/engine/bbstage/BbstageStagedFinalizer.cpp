@@ -19,6 +19,7 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace adios2
@@ -183,6 +184,22 @@ void BbstageStagedFinalizer::RunDataJob(Session &s, BbstageDrainJob &job)
         if (sfd < 0)
         {
             ThrowPosix("open staging file for drain " + stagingPath);
+        }
+        // Verify the staging file size before draining (mirrors the engine's
+        // check): fail fast with both sizes instead of a short read mid-copy.
+        struct stat st;
+        if (fstat(sfd, &st) != 0)
+        {
+            close(sfd);
+            ThrowPosix("fstat staging file for drain " + stagingPath);
+        }
+        if (static_cast<size_t>(st.st_size) != dataSize)
+        {
+            close(sfd);
+            throw std::runtime_error("bbstage finalizer: staging file " + stagingPath +
+                                     " has size " + std::to_string(st.st_size) + ", expected " +
+                                     std::to_string(dataSize) +
+                                     " (staging file truncated or corrupted)");
         }
         std::vector<char> buf(DrainCopyBufferSize);
         size_t remain = dataSize;

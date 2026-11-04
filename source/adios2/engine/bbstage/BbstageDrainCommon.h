@@ -43,7 +43,6 @@ struct BbstageDrainJob
 {
     size_t Seq = 0; // data job sequence number (one data job per step)
     size_t Step = 0;
-    bool IsCommit = false;
     // data job:
     std::string StagingPath;
     uint64_t FinalPos = 0; // offset of the step in the final data sub-file

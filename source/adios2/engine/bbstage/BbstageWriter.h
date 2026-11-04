@@ -56,7 +56,11 @@ namespace engine
  *   - The per-step metadata is aggregated collectively at EndStep() time,
  *     but its *commit* to the BP5 metadata files (.bp md.0/md.idx/mmd.0) is
  *     performed by a rank-0 committer thread only once the data of that
- *     step has been drained by every writer rank. The metadata commit is the
+ *     step has been drained on every writer rank. Aggregate mode: the
+ *     committer instead gates on one progress record per node, published by
+ *     the node leader only after the whole node's step has been drained; a
+ *     published node record therefore guarantees that every rank's data on
+ *     that node is already on the final store. The metadata commit is the
  *     visibility point, so a standard "bp5" reader (including streaming
  *     readers) never observes a step whose data is not yet on the final
  *     store.
@@ -126,7 +130,14 @@ namespace engine
  *                       with the node count instead of the rank count, which
  *                       matters for the metadata servers and for readers on
  *                       very large jobs. Off critical path: aggregation runs
- *                       in the existing background drain workers.
+ *                       in the existing background drain workers. Must be
+ *                       identical on every rank: it drives node collectives
+ *                       at Open/EndStep, and a mismatch would deadlock or
+ *                       silently miscompute offsets; it is validated
+ *                       collectively at Open and a mismatch is reported as
+ *                       an error. StripeSize (when > 1) aligns the node
+ *                       sub-file's step base only; member slices within one
+ *                       step are contiguous.
  *
  * Environment variables (fallbacks for when the engine is reached through
  * middleware such as openPMD-api, which cannot pass engine parameters;
@@ -188,7 +199,7 @@ private:
 
     // metadata
     void AggregateAndEnqueueCommit(format::BP5Serializer::TimestepInfo &TSInfo, uint64_t finalPos,
-                                   size_t dataSize);
+                                   size_t dataSize, size_t step);
     void MakeBbHeader(std::vector<char> &buffer, size_t &position, const std::string &fileType,
                       const bool isActive);
     void WriteIndexHeaderAndWriterMap();
@@ -240,7 +251,9 @@ private:
     size_t m_WriterStep = 0;
     bool m_IsFirstStep = true;
     bool m_MarshalAttributesNecessary = true;
-    uint64_t m_DataPos = 0;     // next append offset in the final data sub-file
+    uint64_t m_DataPos = 0;     // next append offset in the final data sub-file;
+                                // aggregate: node append offset, advanced by the node
+                                // leader only (non-leaders keep 0)
     uint64_t m_StagedBytes = 0; // bytes staged so far (progress accounting)
     uint64_t m_MetaDataPos = 0; // rank 0: append position in md.0
 
@@ -259,7 +272,8 @@ private:
     std::set<size_t> m_DoneDataSeqs;
     size_t m_CommitEnqueued = 0;
     size_t m_CommitDone = 0;
-    uint64_t m_ProgressBytes = 0; // bytes drained (progress record)
+    uint64_t m_ProgressBytes = 0; // bytes drained (progress record); summed in job
+                                  // completion order, not the contiguous drained prefix
     std::exception_ptr m_DrainError;
 
 #define declare_type(T)                                                                            \

@@ -34,6 +34,7 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace adios2
@@ -69,11 +70,22 @@ std::string SanitizeForPath(const std::string &name)
     return out;
 }
 
-[[noreturn]] void ThrowPosix(const std::string &what)
+void ThrowPosix(const std::string &what)
 {
+    // helper::Throw (adiosLog.h) always throws, so control never returns from
+    // here; it carries no [[noreturn]] attribute, so neither does this
+    // wrapper (compilers cannot prove the throw through the template).
     helper::Throw<std::runtime_error>("Engine", "BbstageWriter", what,
                                       what + ": " + std::string(std::strerror(errno)));
-    std::abort(); // helper::Throw always throws; keep the noreturn contract explicit
+}
+
+// BBSTAGE_TIMING=1 enables per-phase Open/Close timing lines on stderr
+// (diagnostics for slow Open/Close on a new system; off by default so
+// production application logs stay clean).
+bool BbstageTimingEnabled()
+{
+    std::string v;
+    return helper::GetEnv("BBSTAGE_TIMING", v) && (v == "1" || v == "true" || v == "on");
 }
 
 void PwriteAll(int fd, const std::vector<core::iovec> &iovs, uint64_t offset)
@@ -182,12 +194,50 @@ void BbstageWriter::Init()
         m_BurstBufferPath = m_Parameters.BurstBufferPath;
     }
 
+    // Aggregate must be identical on every rank: it drives node collectives
+    // at Open/EndStep, so a mismatch would deadlock (or silently miscompute
+    // offsets) with no visible failure. Validate collectively before any
+    // aggregate collective; runs on every rank, also when aggregate is off,
+    // because it is a collective itself.
+    {
+        const int agg = m_Aggregate ? 1 : 0;
+        int aggMin = 0;
+        int aggMax = 0;
+        m_Comm.Allreduce(&agg, &aggMin, 1, helper::Comm::Op::Min, "bbstage aggregate uniformity");
+        m_Comm.Allreduce(&agg, &aggMax, 1, helper::Comm::Op::Max, "bbstage aggregate uniformity");
+        if (aggMin != aggMax)
+        {
+            helper::Throw<std::invalid_argument>("Engine", "BbstageWriter", "Init",
+                                                 "Aggregate must be 'on' or 'off' on every "
+                                                 "rank: rank " +
+                                                     std::to_string(m_RankMPI) + " has '" +
+                                                     (m_Aggregate ? "on" : "off") +
+                                                     "' but at least one other rank differs");
+        }
+    }
+
     // Aggregate mode: resolve the node topology (grouping, leader, per-node
     // communicator) while MPI is alive. It must run before InitTransports,
     // which opens the data sub-files based on the node grouping.
     if (m_Aggregate)
     {
+        const bool doTiming = BbstageTimingEnabled();
+        if (doTiming)
+        {
+            std::cerr << "bbstage rank " << m_RankMPI << " node-topology-start\n";
+            std::cerr.flush();
+        }
+        const auto tTopoStart = std::chrono::steady_clock::now();
         SetupNodeTopology();
+        if (doTiming)
+        {
+            const double ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - tTopoStart)
+                                  .count();
+            std::cerr << "bbstage rank " << m_RankMPI << " node-topology @"
+                      << static_cast<long long>(ms) << " ms\n";
+            std::cerr.flush();
+        }
     }
 
     InitTransports();
@@ -408,17 +458,29 @@ void BbstageWriter::SetupNodeTopology()
     m_NodeSize = m_NodeComm.Size();
     m_IsLeader = (m_NodeLocalRank == 0);
     m_NodeMembers = m_NodeComm.AllGatherValues(m_RankMPI);
+
+    // The committer's in-memory fast path covers rank 0's own node and reads
+    // progress files for the other nodes; that is only correct if rank 0 is
+    // node 0's leader. It holds by construction (node ids are assigned in
+    // first-appearance order, so rank 0 opens node 0, and the node-local
+    // order follows the global rank), but enforce it at Open instead of
+    // trusting it: a violation would silently skip a node's progress gate.
+    if (m_RankMPI == 0 && (!m_IsLeader || m_NodeIndex != 0))
+    {
+        helper::Throw<std::logic_error>("Engine", "BbstageWriter", "SetupNodeTopology",
+                                        "rank 0 is not the leader of node 0 (leader=" +
+                                            std::string(m_IsLeader ? "yes" : "no") +
+                                            ", nodeIndex=" + std::to_string(m_NodeIndex) +
+                                            "); the committer's own-node fast path would be "
+                                            "invalid");
+    }
 }
 
 void BbstageWriter::InitTransports()
 {
-    // Opt-in per-phase Open timing: BBSTAGE_TIMING=1 prints one line per
-    // phase per rank to stderr. Useful when diagnosing slow Open/Close on a
-    // system (e.g. the first deployment on a new machine); off by default so
-    // production application logs stay clean.
-    std::string timingEnv;
-    const bool doTiming = helper::GetEnv("BBSTAGE_TIMING", timingEnv) &&
-                          (timingEnv == "1" || timingEnv == "true" || timingEnv == "on");
+    // Opt-in per-phase Open timing (BBSTAGE_TIMING=1): one line per phase per
+    // rank to stderr; see BbstageTimingEnabled().
+    const bool doTiming = BbstageTimingEnabled();
     const auto tOpenStart = std::chrono::steady_clock::now();
     const auto openPhase = [this, tOpenStart, doTiming](const char *phase) {
         if (!doTiming)
@@ -546,10 +608,10 @@ void BbstageWriter::InitTransports()
         // Aggregate mode: the watermark is a per-node budget (the leader
         // tracks the node's total staged-but-undrained bytes), so scale the
         // per-rank setting by the number of ranks on this node.
-        const uint64_t watermark = m_Aggregate
-                                       ? m_StagingWatermarkBytes *
-                                             static_cast<uint64_t>(m_NodeSize > 0 ? m_NodeSize : 1)
-                                       : m_StagingWatermarkBytes;
+        // m_NodeSize is m_NodeComm.Size() and therefore >= 1.
+        const uint64_t watermark =
+            m_Aggregate ? m_StagingWatermarkBytes * static_cast<uint64_t>(m_NodeSize)
+                        : m_StagingWatermarkBytes;
         BbstageStagedFinalizer::Instance().SetStagingWatermark(watermark);
     }
     else
@@ -762,7 +824,9 @@ void BbstageWriter::EndStep()
 
     // Collective, small: aggregate this step's metadata and queue its commit
     // on rank 0. The commit only becomes visible once the data has drained.
-    AggregateAndEnqueueCommit(TSInfo, finalPos, dataSize);
+    // The step number is passed explicitly: ++m_WriterStep happens right
+    // after this call, and the commit gate compares against step + 1.
+    AggregateAndEnqueueCommit(TSInfo, finalPos, dataSize, m_WriterStep);
 
     ++m_WriterStep;
 }
@@ -897,12 +961,19 @@ void BbstageWriter::WorkerLoop()
             {
                 const uint64_t publishSteps = m_DrainedWatermark;
                 const uint64_t publishBytes = m_ProgressBytes;
-                m_PublishedSteps = publishSteps;
-                // publish under the lock so sequence numbers stay serialized
-                // across drain threads; the update itself is one small pwrite
+                // Aggregate mode: this job drained every member of the node,
+                // so publishing progress here means all of the node's data is
+                // on the final store. This is the invariant the rank-0
+                // committer relies on when it gates commits on node progress
+                // records.
+                // Publish under the lock so sequence numbers stay serialized
+                // across drain threads; the update itself is one small
+                // pwrite. m_PublishedSteps is only advanced after a
+                // successful write, so a failing publish stays retryable.
                 try
                 {
                     WriteProgress(publishSteps, publishBytes);
+                    m_PublishedSteps = publishSteps;
                 }
                 catch (...)
                 {
@@ -928,6 +999,25 @@ void BbstageWriter::RunDataJob(DrainJob &job)
         if (sfd < 0)
         {
             ThrowPosix("open staging file for drain " + stagingPath);
+        }
+        // Verify the staging file size before draining: a file left short by
+        // a crash (or overwritten by external cleanup) would otherwise
+        // surface as a confusing short read mid-copy; fail fast with both
+        // sizes instead.
+        struct stat st;
+        if (fstat(sfd, &st) != 0)
+        {
+            close(sfd);
+            ThrowPosix("fstat staging file for drain " + stagingPath);
+        }
+        if (static_cast<size_t>(st.st_size) != dataSize)
+        {
+            close(sfd);
+            helper::Throw<std::runtime_error>("Engine", "BbstageWriter", "RunDataJob",
+                                              "staging file " + stagingPath + " has size " +
+                                                  std::to_string(st.st_size) + ", expected " +
+                                                  std::to_string(dataSize) +
+                                                      " (staging file truncated or corrupted)");
         }
         std::vector<char> buf(DrainCopyBufferSize);
         size_t remain = dataSize;
@@ -1205,7 +1295,7 @@ void BbstageWriter::DrainAndCommitAll()
 /* ---- metadata ------------------------------------------------------------ */
 
 void BbstageWriter::AggregateAndEnqueueCommit(format::BP5Serializer::TimestepInfo &TSInfo,
-                                             uint64_t finalPos, size_t dataSize)
+                                             uint64_t finalPos, size_t dataSize, size_t step)
 {
     core::iovec m{TSInfo.MetaEncodeBuffer->Data(), TSInfo.MetaEncodeBuffer->m_FixedSize};
     core::iovec a{nullptr, 0};
@@ -1264,8 +1354,7 @@ void BbstageWriter::AggregateAndEnqueueCommit(format::BP5Serializer::TimestepInf
     }
 
     DrainJob job;
-    job.Step = m_WriterStep;
-    job.IsCommit = true;
+    job.Step = step;
 
     // mmd.0 records: [idLen][infoLen][id][info] per new meta-metadata block
     {
@@ -1381,6 +1470,7 @@ void BbstageWriter::MakeBbHeader(std::vector<char> &buffer, size_t &position,
     else if (versionLongTagSize > m_VersionTagLength)
     {
         helper::CopyToBuffer(buffer, position, versionLongTag.c_str(), m_VersionTagLength);
+        position += m_VersionTagLength;
     }
     else
     {
@@ -1646,12 +1736,9 @@ void BbstageWriter::DoClose(const int /*transportIndex*/)
         return;
     }
 
-    // Opt-in per-phase Close timing; see the matching block in
-    // InitTransports (BBSTAGE_TIMING=1).
-    std::string timingEnvClose;
-    const bool doTimingClose =
-        helper::GetEnv("BBSTAGE_TIMING", timingEnvClose) &&
-        (timingEnvClose == "1" || timingEnvClose == "true" || timingEnvClose == "on");
+    // Opt-in per-phase Close timing (BBSTAGE_TIMING=1); see
+    // BbstageTimingEnabled().
+    const bool doTimingClose = BbstageTimingEnabled();
     const auto tCloseStart = std::chrono::steady_clock::now();
     const auto closePhase = [this, tCloseStart, doTimingClose](const char *phase) {
         if (!doTimingClose)
