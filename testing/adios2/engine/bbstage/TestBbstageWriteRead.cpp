@@ -9,10 +9,13 @@
 #include <mpi.h>
 #endif
 
+#include "adios2/engine/bbstage/BbstageStagedFinalizer.h"
+
 #include <gtest/gtest.h>
 
 #include <chrono>
 #include <filesystem>
+#include <limits>
 #include <numeric>
 #include <string>
 #include <thread>
@@ -394,6 +397,108 @@ TEST_F(EngineBbstage, StagedAggregateDrainReadBackBP5)
         }
         reader.Close();
     }
+}
+
+// Staged close + watermark backpressure with the concurrent drain: one
+// session whose run total (16 MiB per rank) exceeds the staging watermark
+// (4 MiB), which still exceeds one step (1 MiB). Before the drain workers
+// started at Open this write loop would block at the watermark until Close()
+// -- i.e. forever; it can only complete because the in-flight drain keeps
+// releasing the watermark step by step.
+TEST_F(EngineBbstage, StagedWatermarkConcurrentDrain)
+{
+    constexpr size_t n = 256 * 1024; // 1 MiB of floats per step per rank
+    constexpr int nSteps = 16; // 16 MiB total per rank
+    const int rank = MpiRank();
+    const int size = MpiSize();
+    const size_t globalN = n * static_cast<size_t>(size);
+
+    {
+        adios2::IO io = m_Adios.DeclareIO("bbstage-staged-wm-writer");
+        io.SetEngine("bbstage");
+        io.SetParameters({{"BurstBufferPath", StagingDir}, {"CloseMode", "staged"},
+                          {"StagingWatermarkMB", "4"}, {"CommitTimeoutSecs", "30"}});
+
+        auto gvar = io.DefineVariable<float>("gdata", {globalN},
+                                             {static_cast<size_t>(rank) * n}, {n});
+        io.DefineAttribute<std::string>("written_by", "bbstage-staged-wm");
+
+        adios2::Engine engine = io.Open(TestName, adios2::Mode::Write);
+        for (int s = 0; s < nSteps; ++s)
+        {
+            auto v = MakeStep(s, n);
+            engine.BeginStep();
+            engine.Put<float>(gvar, v.data());
+            engine.EndStep();
+        }
+        engine.Close();
+    }
+#if ADIOS2_USE_MPI
+    MPI_Barrier(MPI_COMM_WORLD);
+#endif
+
+    // Wait for the background finalizer to drain the remainder, commit, and
+    // publish the durability marker.
+    {
+        const std::string fin = (std::filesystem::path(TestName) / "bbstage.final").string();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        while (!std::filesystem::exists(fin))
+        {
+            if (std::chrono::steady_clock::now() > deadline)
+            {
+                FAIL() << "timed out waiting for the bbstage.final marker of " << TestName;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+
+    // Read back with the stock bp5 engine; must be byte-identical.
+    {
+        adios2::IO io = m_Adios.DeclareIO("bp5-reader-staged-wm");
+        io.SetEngine("bp5");
+        adios2::Engine reader = io.Open(TestName, adios2::Mode::ReadRandomAccess);
+        EXPECT_EQ(reader.Steps(), static_cast<size_t>(nSteps));
+        auto gvar = io.InquireVariable<float>("gdata");
+        ASSERT_TRUE(static_cast<bool>(gvar));
+        auto attr = io.InquireAttribute<std::string>("written_by");
+        ASSERT_TRUE(static_cast<bool>(attr));
+        EXPECT_EQ(attr.Data()[0], "bbstage-staged-wm");
+
+        for (size_t s = 0; s < static_cast<size_t>(nSteps); ++s)
+        {
+            auto expected = MakeGlobalStep(s, n, size);
+            std::vector<float> got(globalN);
+            gvar.SetStepSelection({s, 1});
+            gvar.SetSelection({{0}, {globalN}});
+            reader.Get<float>(gvar, got.data(), adios2::Mode::Sync);
+            EXPECT_EQ(got, expected) << "step " << s;
+        }
+        reader.Close();
+    }
+}
+
+// The staged watermark backpressure stall error: with no drain progress, an
+// AccountStaged() that cannot fit under the watermark must throw after the
+// stall timeout instead of blocking forever. Driven at the finalizer
+// singleton level (no engine involved), so it is fast and deterministic.
+TEST_F(EngineBbstage, StagedWatermarkStallTimeout)
+{
+    auto &fin = adios2::core::engine::BbstageStagedFinalizer::Instance();
+    // known starting state: no pending bytes (clamped), no watermark
+    fin.AccountDrained(std::numeric_limits<uint64_t>::max());
+    fin.SetStagingWatermark(0);
+    fin.SetStagingStallTimeout(0.5f);
+
+    fin.SetStagingWatermark(1024);
+    fin.AccountStaged(1000); // fits: 0 pending + 1000 <= 1024
+    // 1000 pending + 1000 new > 1024 and no drain is making progress: the
+    // stall timeout must fire instead of a silent hang.
+    EXPECT_THROW(fin.AccountStaged(1000), std::runtime_error);
+
+    // restore the singleton for the other tests
+    fin.AccountDrained(1000);
+    fin.SetStagingWatermark(0);
+    fin.SetStagingStallTimeout(300.f);
 }
 
 int main(int argc, char **argv)

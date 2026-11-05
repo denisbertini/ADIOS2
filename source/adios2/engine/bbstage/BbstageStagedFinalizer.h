@@ -32,10 +32,12 @@ namespace engine
  * (CloseMode=staged).
  *
  * In staged mode the application-visible checkpoint cost ends at the
- * node-local burst-buffer write: Close() hands the whole session (undrained
- * staging files, data sub-file fd, metadata transports, commit queue) to
- * this singleton and returns immediately, so the application goes on with
- * computation while the data is drained to the final store in the
+ * node-local burst-buffer write. The drain workers run concurrently from
+ * Open (the burst buffer then holds only the in-flight drain backlog, not
+ * the whole run), and Close() hands the remaining session (leftover staging
+ * files, data sub-file fd, metadata transports, commit queue) to this
+ * singleton and returns immediately, so the application goes on with
+ * computation while the remainder is drained to the final store in the
  * background. One drain worker (every rank) and one committer worker (rank 0
  * only) process the sessions in hand-off order. No MPI is used after the
  * hand-off: all inter-rank coordination is through the drain progress files,
@@ -119,9 +121,23 @@ public:
 
     /** Staged-mode backpressure: block until `bytes` fit under the
      *  per-rank staging watermark (bytes >= watermark skips the wait), then
-     *  account for them. Watermark 0 = unlimited. */
+     *  account for them. Watermark 0 = unlimited.
+     *
+     *  The drain workers run from Open, so a blocked call is released as
+     *  drain jobs complete (see AccountDrained). If the pending bytes make
+     *  no progress for m_StagingStallTimeoutSecs while blocked, throws
+     *  instead of waiting forever: a stalled drain is a failure the
+     *  application must see, not a silent hang. */
     void AccountStaged(uint64_t bytes);
     void SetStagingWatermark(uint64_t bytes);
+
+    /** Account a drain completion of `bytes` (drain workers only): releases
+     *  the AccountStaged() backpressure wait. */
+    void AccountDrained(uint64_t bytes);
+
+    /** Staged mode: time in seconds without drain progress before
+     *  AccountStaged() throws (0 = wait forever, default 300). */
+    void SetStagingStallTimeout(float secs);
 
     ~BbstageStagedFinalizer();
     BbstageStagedFinalizer(const BbstageStagedFinalizer &) = delete;
@@ -135,6 +151,9 @@ private:
     void WaitForSessionDrained(Session &s, size_t step);
     void FinalizeSession(Session &s);
     void PublishProgress(Session &s); // called under m_Mutex
+    // data-side cleanup of a fully drained session (fsync, close fds, remove
+    // the staging dir); called outside m_Mutex by a single actor
+    void CompleteSessionData(Session &s);
 
     std::mutex m_Mutex;
     std::condition_variable m_DataCV;
@@ -154,6 +173,7 @@ private:
 
     uint64_t m_StagingWatermark = 0; // 0 = unlimited
     uint64_t m_PendingStaged = 0;    // staged bytes not yet drained (this rank)
+    float m_StagingStallTimeoutSecs = 300.f; // 0 = wait forever
 
     std::exception_ptr m_Error;
 };

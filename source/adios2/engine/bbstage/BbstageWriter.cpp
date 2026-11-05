@@ -388,6 +388,9 @@ void BbstageWriter::SetupNodeTopology()
         m_IsLeader = true;
         m_NodeMembers = {m_RankMPI};
         m_NodeIndexPerRank.assign(1, 0);
+        // The aggregate code paths use m_NodeComm unconditionally, so even
+        // the degenerate one-rank "node" needs a valid communicator.
+        m_NodeComm = m_Comm.Duplicate("bbstage node communicator");
         return;
     }
 
@@ -603,8 +606,13 @@ void BbstageWriter::InitTransports()
     openPhase("barrier2");
     if (m_CloseModeStaged)
     {
-        // staged close: no per-instance drain workers; the process-level
-        // finalizer takes the session over at Close() and does the draining.
+        // staged close: the drain workers run concurrently from Open (as in
+        // durable mode), so the burst buffer holds only the in-flight drain
+        // backlog instead of the whole run; Close() hands the remaining
+        // session to the process-level finalizer, which commits the
+        // metadata and drains the remainder while the application computes.
+        // Workers only: the commit stays deferred to the finalizer, so no
+        // rank-0 committer thread starts here.
         // Aggregate mode: the watermark is a per-node budget (the leader
         // tracks the node's total staged-but-undrained bytes), so scale the
         // per-rank setting by the number of ranks on this node.
@@ -612,7 +620,10 @@ void BbstageWriter::InitTransports()
         const uint64_t watermark =
             m_Aggregate ? m_StagingWatermarkBytes * static_cast<uint64_t>(m_NodeSize)
                         : m_StagingWatermarkBytes;
-        BbstageStagedFinalizer::Instance().SetStagingWatermark(watermark);
+        auto &finalizer = BbstageStagedFinalizer::Instance();
+        finalizer.SetStagingWatermark(watermark);
+        finalizer.SetStagingStallTimeout(m_CommitTimeoutSecs);
+        StartDrainWorkers();
     }
     else
     {
@@ -864,7 +875,7 @@ void BbstageWriter::NotifyEngineAttribute(std::string /*name*/, AttributeBase *A
 
 /* ---- drain machinery (daemonless stand-in for bbviewd) --------------------- */
 
-void BbstageWriter::StartDrainThreads()
+void BbstageWriter::StartDrainWorkers()
 {
     // Aggregate mode: only the node leader drains (it copies every rank on the
     // node); non-leaders have no data to drain, so they start no workers.
@@ -875,6 +886,11 @@ void BbstageWriter::StartDrainThreads()
             m_DrainWorkers.emplace_back(&BbstageWriter::WorkerLoop, this);
         }
     }
+}
+
+void BbstageWriter::StartDrainThreads()
+{
+    StartDrainWorkers();
     if (m_RankMPI == 0)
     {
         m_CommitterThread = std::thread(&BbstageWriter::CommitterLoop, this);
@@ -908,26 +924,22 @@ void BbstageWriter::WorkerLoop()
     for (;;)
     {
         DrainJob job;
-        bool have = false;
         {
             std::unique_lock<std::mutex> lck(m_Mutex);
             m_DataCV.wait(lck, [this] {
                 return m_Finishing || m_DrainError != nullptr || !m_DataQueue.empty();
             });
-            if (!m_DataQueue.empty())
+            // Stop: the leftover queue is not this worker's to drain. Durable
+            // Close() drains it synchronously (DrainAndCommitAll) before
+            // stopping the threads; staged Close() hands it to the finalizer
+            // after the join; the abandoned-engine path (DestructorClose)
+            // drops it on purpose (the documented burst-buffer contract).
+            if (m_Finishing || m_DrainError)
             {
-                job = std::move(m_DataQueue.front());
-                m_DataQueue.pop_front();
-                have = true;
+                return;
             }
-            else
-            {
-                return; // finishing or error and nothing left
-            }
-        }
-        if (!have)
-        {
-            continue;
+            job = std::move(m_DataQueue.front());
+            m_DataQueue.pop_front();
         }
 
         try
@@ -983,6 +995,14 @@ void BbstageWriter::WorkerLoop()
                     }
                 }
             }
+        }
+        if (m_CloseModeStaged)
+        {
+            // Release the staging watermark backpressure: this job's bytes
+            // are on the final store. (The finalizer's own workers account
+            // the jobs they drain after the Close hand-off; each job is
+            // drained, and accounted, by exactly one actor.)
+            BbstageStagedFinalizer::Instance().AccountDrained(job.DataSize);
         }
         m_DataCV.notify_all();
         m_CommitCV.notify_all();
@@ -1756,14 +1776,23 @@ void BbstageWriter::DoClose(const int /*transportIndex*/)
     if (m_CloseModeStaged)
     {
         // Staged close: the application-visible checkpoint cost ends here.
-        // The session (undrained staging files, data sub-file fd, metadata
+        // The session (leftover staging files, data sub-file fd, metadata
         // transports, commit queue) is handed to the process-level finalizer,
-        // which drains to the final store and commits the metadata in the
-        // background while the application computes. The finalizer's
-        // destructor (clean process exit) is the durability barrier; a crash
-        // loses the sessions that were not finalized yet (no bbstage.final
-        // marker).
+        // which drains the remainder to the final store and commits the
+        // metadata in the background while the application computes. The
+        // finalizer's destructor (clean process exit) is the durability
+        // barrier; a crash loses the sessions that were not finalized yet
+        // (no bbstage.final marker).
         BbstageStagedFinalizer::Instance().CheckError();
+
+        // The concurrent drain workers stop before the hand-off: the join
+        // lets an in-flight job finish (drain, progress publish, state
+        // update) so the session snapshot below is consistent and no two
+        // drain actors ever touch the same job or fd.
+        StopDrainThreads();
+        // Surface a mid-run drain failure now, while the error is still
+        // attributable to this engine's session.
+        CheckDrainError();
 
         BbstageStagedFinalizer::Session session;
         session.FinalDir = m_Name;

@@ -99,24 +99,38 @@ namespace engine
  *                       (default 2 ms)
  *   CommitTimeoutSecs   give up gating a metadata commit after this long
  *                       waiting for slow/dead peers (default 300, 0 = wait
- *                       forever)
+ *                       forever). In staged mode it is also the stall
+ *                       timeout of the staging watermark backpressure:
+ *                       EndStep() blocked at the watermark throws after
+ *                       this long without drain progress instead of
+ *                       hanging.
  *   DeleteStagedFiles   remove staging files once drained (default true)
- *   CloseMode           "durable" (default) or "staged". Staged: Close()
- *                       returns as soon as the last step is written to the
- *                       node-local burst buffer; the drain and the metadata
- *                       commit then run in the process background
- *                       (BbstageStagedFinalizer) while the application
- *                       computes. A clean process exit finalizes every
- *                       pending session before the process ends; a crash
- *                       loses the checkpoints that were staged but not yet
- *                       finalized. Finalization publishes
- *                       <finalDir>/bbstage.final, the durability/visibility
- *                       marker for readers and restart policies.
+ *   CloseMode           "durable" (default) or "staged". Staged: the drain
+ *                       workers run concurrently from Open (exactly as in
+ *                       durable mode), so the node-local burst buffer holds
+ *                       only the in-flight drain backlog, not the whole
+ *                       run; Close() hands the remaining session (leftover
+ *                       staging files, data sub-file fd, metadata
+ *                       transports, commit queue) to the process-level
+ *                       finalizer (BbstageStagedFinalizer) and returns as
+ *                       soon as the last step is written to the node-local
+ *                       burst buffer, so the application goes on with
+ *                       computation while the metadata commit and the drain
+ *                       remainder run in the background. A clean process
+ *                       exit finalizes every pending session before the
+ *                       process ends; a crash loses the checkpoints that
+ *                       were staged but not yet finalized. Finalization
+ *                       publishes <finalDir>/bbstage.final, the
+ *                       durability/visibility marker for readers and
+ *                       restart policies.
  *   StagingWatermarkMB  staged mode: per-rank cap on staged-but-undrained
- *                       bytes; EndStep() blocks above it so the node-local
+ *                       bytes; EndStep() blocks above it until the
+ *                       concurrent drain catches up so the node-local
  *                       burst buffer cannot fill (default 1024, 0 =
- *                       unlimited). In Aggregate mode the cap applies to the
- *                       whole node: the effective node budget is
+ *                       unlimited). A blocked EndStep() that sees no drain
+ *                       progress for CommitTimeoutSecs throws instead of
+ *                       waiting forever. In Aggregate mode the cap applies
+ *                       to the whole node: the effective node budget is
  *                       StagingWatermarkMB times the number of ranks on the
  *                       node, tracked as the node's total staged-but-undrained
  *                       bytes.
@@ -186,7 +200,8 @@ private:
     void MarshalAttributes();
 
     // drain machinery (the daemonless stand-in for bbviewd)
-    void StartDrainThreads();
+    void StartDrainWorkers(); // drain workers only (staged mode: no committer)
+    void StartDrainThreads(); // workers + rank-0 committer (durable mode)
     void StopDrainThreads() noexcept;
     void WorkerLoop();
     void CommitterLoop();

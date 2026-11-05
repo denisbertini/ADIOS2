@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <sstream>
 #include <stdexcept>
 #include <system_error>
 #include <thread>
@@ -74,8 +75,15 @@ void BbstageStagedFinalizer::SetStagingWatermark(uint64_t bytes)
     m_StagingWatermark = bytes;
 }
 
+void BbstageStagedFinalizer::SetStagingStallTimeout(float secs)
+{
+    std::lock_guard<std::mutex> lck(m_Mutex);
+    m_StagingStallTimeoutSecs = secs;
+}
+
 void BbstageStagedFinalizer::AccountStaged(uint64_t bytes)
 {
+    const auto now = [] { return std::chrono::steady_clock::now(); };
     std::unique_lock<std::mutex> lck(m_Mutex);
     if (m_Error)
     {
@@ -85,15 +93,65 @@ void BbstageStagedFinalizer::AccountStaged(uint64_t bytes)
     // throttled (it would deadlock); let it through.
     if (m_StagingWatermark > 0 && bytes < m_StagingWatermark)
     {
-        m_StagingCV.wait(lck, [this, bytes] {
-            return m_Error != nullptr || m_PendingStaged <= m_StagingWatermark - bytes;
-        });
+        const bool forever = (m_StagingStallTimeoutSecs <= 0.f);
+        // Poll-based wait: the drain workers run from Open and release this
+        // wait as jobs complete (AccountDrained), so normally the CV notify
+        // wakes us long before the poll interval. The periodic wake-up is
+        // what makes the stall detection below possible.
+        const auto stallTimeout = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<float>(m_StagingStallTimeoutSecs));
+        uint64_t pendingMin = m_PendingStaged;
+        auto lastProgress = now();
+        for (;;)
+        {
+            if (m_Error != nullptr)
+            {
+                break;
+            }
+            if (m_PendingStaged <= m_StagingWatermark - bytes)
+            {
+                break; // the new bytes fit under the watermark
+            }
+            if (m_PendingStaged < pendingMin)
+            {
+                pendingMin = m_PendingStaged;
+                lastProgress = now();
+            }
+            else if (!forever && (now() - lastProgress) > stallTimeout)
+            {
+                // The burst buffer is full at the watermark and the drain
+                // has made no progress for the whole stall timeout: waiting
+                // longer will not help. Report it instead of hanging.
+                std::ostringstream err;
+                err << "bbstage staged close: staging watermark of "
+                    << m_StagingWatermark << " bytes reached with " << m_PendingStaged
+                    << " bytes still pending and no drain progress for "
+                    << m_StagingStallTimeoutSecs << " s; the drain to the final "
+                    "store is stalled (slow or unreachable final store, or "
+                    "a burst buffer that the run cannot keep below the "
+                    "watermark)";
+                throw std::runtime_error(err.str());
+            }
+            m_StagingCV.wait_for(lck, std::chrono::milliseconds(100));
+        }
         if (m_Error)
         {
             std::rethrow_exception(m_Error);
         }
     }
     m_PendingStaged += bytes;
+}
+
+void BbstageStagedFinalizer::AccountDrained(uint64_t bytes)
+{
+    {
+        std::lock_guard<std::mutex> lck(m_Mutex);
+        // clamp: a job's bytes may have been accounted under a different
+        // watermark configuration (e.g. watermark set mid-run), so never
+        // underflow
+        m_PendingStaged = (m_PendingStaged > bytes) ? m_PendingStaged - bytes : 0;
+    }
+    m_StagingCV.notify_all();
 }
 
 void BbstageStagedFinalizer::CheckError()
@@ -122,13 +180,77 @@ void BbstageStagedFinalizer::RegisterSession(Session session)
         }
         m_WorkersStarted = true;
     }
-    if (session.NextDataSeq == 0)
+    // The concurrent drain (staged mode) may have fully drained the session
+    // before the hand-off: no job is left for the drain worker to complete,
+    // so DataDone would never be set and the session could never be
+    // finalized. Detect the already-drained state here; the degenerate
+    // zero-step session is a special case of it.
+    if (session.DrainedWatermark >= session.NextDataSeq && session.DataQueue.empty())
     {
-        session.DataDone = true; // degenerate: no steps staged, nothing to drain
+        session.DataDone = true;
     }
-    m_Sessions.push_back(std::make_shared<Session>(std::move(session)));
+    auto sp = std::make_shared<Session>(std::move(session));
+    m_Sessions.push_back(sp);
+    if (sp->DataDone)
+    {
+        // The workers only run the data-side cleanup (fsync, close fds,
+        // remove the staging dir) when the session's last job completes; a
+        // fully drained session has no such job, so run it here. The drain
+        // worker never touches this session (its queue is empty), so this
+        // caller is the single actor for its resources.
+        try
+        {
+            CompleteSessionData(*sp);
+        }
+        catch (...)
+        {
+            if (!m_Error)
+            {
+                m_Error = std::current_exception();
+            }
+            m_DataCV.notify_all();
+            m_CommitCV.notify_all();
+            m_StagingCV.notify_all();
+        }
+    }
     m_DataCV.notify_all();
     m_CommitCV.notify_all();
+}
+
+void BbstageStagedFinalizer::CompleteSessionData(Session &s)
+{
+    // Data-side cleanup of a fully drained session. Called outside
+    // m_Mutex by a single actor (the drain worker after the last job, or
+    // RegisterSession for a session handed over already drained).
+    if (s.DrainDataSync && s.DataFd >= 0 && fsync(s.DataFd) != 0)
+    {
+        ThrowPosix("fsync of data sub-file " + s.DataFileName);
+    }
+    if (s.DataFd >= 0)
+    {
+        close(s.DataFd);
+        s.DataFd = -1;
+    }
+    if (s.ProgressFd >= 0)
+    {
+        close(s.ProgressFd);
+        s.ProgressFd = -1;
+    }
+    // NOTE: the progress FILE must survive until session finalization: the
+    // rank-0 committer polls it (it may start polling after this rank's
+    // drain already finished), and a removed file is indistinguishable from
+    // "no progress". FinalizeSession() removes it once the last commit is
+    // done.
+    std::error_code ec;
+    if (!s.StagingDir.empty())
+    {
+        std::filesystem::remove(s.StagingDir, ec); // succeeds only if empty
+    }
+    if (s.Verbose > 1)
+    {
+        std::cout << "bbstage finalizer rank " << s.Rank << ": all data of "
+                  << s.FinalDir << " drained\n";
+    }
 }
 
 BbstageStagedFinalizer::~BbstageStagedFinalizer()
@@ -372,35 +494,7 @@ void BbstageStagedFinalizer::DrainWorkerLoop()
             if (justDone)
             {
                 // outside the lock: data-side session cleanup (single actor)
-                if (s->DrainDataSync && s->DataFd >= 0 && fsync(s->DataFd) != 0)
-                {
-                    ThrowPosix("fsync of data sub-file " + s->DataFileName);
-                }
-                if (s->DataFd >= 0)
-                {
-                    close(s->DataFd);
-                    s->DataFd = -1;
-                }
-                if (s->ProgressFd >= 0)
-                {
-                    close(s->ProgressFd);
-                    s->ProgressFd = -1;
-                }
-                // NOTE: the progress FILE must survive until session
-                // finalization: the rank-0 committer polls it (it may start
-                // polling after this rank's drain already finished), and a
-                // removed file is indistinguishable from "no progress".
-                // FinalizeSession() removes it once the last commit is done.
-                std::error_code ec;
-                if (!s->StagingDir.empty())
-                {
-                    std::filesystem::remove(s->StagingDir, ec); // succeeds only if empty
-                }
-                if (s->Verbose > 1)
-                {
-                    std::cout << "bbstage finalizer rank " << s->Rank << ": all data of "
-                              << s->FinalDir << " drained\n";
-                }
+                CompleteSessionData(*s);
                 // release sessions fully done on this rank (rank != 0 has no
                 // commit worker, so this worker is the only reclaimer there)
                 {
