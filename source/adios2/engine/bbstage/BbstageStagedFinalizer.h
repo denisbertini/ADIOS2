@@ -71,11 +71,21 @@ public:
         int Rank = 0;
         int WriterCount = 1;
         int Verbose = 0;
-        // Aggregate mode: node-aggregated drain. The session's DataQueue holds
-        // node jobs (Members) on the leader and is empty on non-leaders; the
-        // committer (rank 0) gates on one progress record per node.
+        // Aggregate mode: node-aggregated co-write drain. Every rank drains
+        // its own slices of the shared data.<node> sub-file (its DataQueue
+        // holds its own single-slice jobs, exactly as in non-aggregate mode)
+        // and publishes a node-local progress record (LocalProgressPath);
+        // the node leader (IsNodeLeader) folds them into the one node record
+        // on the final store (ProgressPath) that the committer (rank 0)
+        // gates on.
         bool Aggregate = false;
         int NodeCount = 1;
+        bool IsNodeLeader = false;
+        std::vector<int> NodeMembers; // aggregate: global ranks on the node
+        uint64_t NodePublishedSteps = 0; // leader: steps published in the node record
+        std::string LocalProgressPath;   // aggregate: node-local per-rank record
+        int LocalProgressFd = -1;
+        uint64_t LocalProgressSeq = 0;
 
         // handed-over resources (ownership transfers on registration)
         int DataFd = -1;
@@ -151,6 +161,12 @@ private:
     void WaitForSessionDrained(Session &s, size_t step);
     void FinalizeSession(Session &s);
     void PublishProgress(Session &s); // called under m_Mutex
+    // aggregate co-write, called under m_Mutex:
+    void PublishLocalProgress(Session &s); // node-local per-rank record (every rank)
+    void PublishNodeRecord(Session &s);    // node leader only
+    // release sessions done on this rank; keeps an aggregate node leader
+    // session while its node record is still behind (called under m_Mutex)
+    void EraseDoneSessions();
     // data-side cleanup of a fully drained session (fsync, close fds, remove
     // the staging dir); called outside m_Mutex by a single actor
     void CompleteSessionData(Session &s);

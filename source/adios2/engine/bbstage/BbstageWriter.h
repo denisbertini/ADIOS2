@@ -57,17 +57,20 @@ namespace engine
  *     but its *commit* to the BP5 metadata files (.bp md.0/md.idx/mmd.0) is
  *     performed by a rank-0 committer thread only once the data of that
  *     step has been drained on every writer rank. Aggregate mode: the
- *     committer instead gates on one progress record per node, published by
- *     the node leader only after the whole node's step has been drained; a
- *     published node record therefore guarantees that every rank's data on
- *     that node is already on the final store. The metadata commit is the
- *     visibility point, so a standard "bp5" reader (including streaming
- *     readers) never observes a step whose data is not yet on the final
- *     store.
+ *     committer instead gates on one progress record per node
+ *     (bbstage.drain.<nodeId> on the final store), published by the node
+ *     leader. Each rank on the node publishes its own drain progress to a
+ *     node-local record in the staging directory; the leader folds all of
+ *     them (minimum steps, summed bytes) into the node record, so a
+ *     published node record guarantees that every rank's data on that node
+ *     is already on the final store. The metadata commit is the visibility
+ *     point, so a standard "bp5" reader (including streaming readers) never
+ *     observes a step whose data is not yet on the final store.
  *   - Hand-off is an in-memory FIFO queue plus a small fixed-size drain
- *     progress file per writer in the output directory (bbstage.drain.<r>),
- *     letting the rank-0 committer gate metadata commits; this replaces
- *     bbview's /tmp/bbview.sock + xattr protocol.
+ *     progress file per writer in the output directory (bbstage.drain.<r>;
+ *     one per node in aggregate mode, see above), letting the rank-0
+ *     committer gate metadata commits; this replaces bbview's
+ *     /tmp/bbview.sock + xattr protocol.
  *   - Unlike bbview's fire-and-forget flush, drain errors are recorded and
  *     rethrown to the application at the next EndStep()/Flush()/Close(), and
  *     commit waiting is subject to a configurable timeout.
@@ -75,10 +78,10 @@ namespace engine
  * Output layout is standard BP5 (data.<rank> sub-files, one per writer, plus
  * md.0/md.idx/mmd.0 written by rank 0), so output is readable by stock ADIOS2
  * readers once steps are committed (all steps at Close()). With Aggregate=on
- * the data sub-files are data.<node> (one per node, written by the node
- * leader) and the writer map routes every rank to its node's sub-file; the
- * output is still stock-BP5 readable (the same layout BP5's TwoLevelShm
- * aggregation produces).
+ * the data sub-files are data.<node> (one per node, co-written by every rank
+ * on the node at pre-assigned, disjoint offsets) and the writer map routes
+ * every rank to its node's sub-file; the output is still stock-BP5 readable
+ * (the same layout BP5's TwoLevelShm aggregation produces).
  *
  * Reads: use engine "bp5" (this engine registers BP5Reader as its read side).
  * Direct reads of steps still sitting in the local-SSD burst buffer
@@ -129,29 +132,32 @@ namespace engine
  *                       burst buffer cannot fill (default 1024, 0 =
  *                       unlimited). A blocked EndStep() that sees no drain
  *                       progress for CommitTimeoutSecs throws instead of
- *                       waiting forever. In Aggregate mode the cap applies
- *                       to the whole node: the effective node budget is
- *                       StagingWatermarkMB times the number of ranks on the
- *                       node, tracked as the node's total staged-but-undrained
- *                       bytes.
+ *                       waiting forever. The cap is per rank in both
+ *                       aggregation modes (aggregate co-write: every rank
+ *                       drains its own bytes).
  *   Aggregate           "on"/"off" (default "off"). "on": node-aggregated
- *                       drain. Local staging stays per-rank (unchanged
- *                       critical path), but the SSD -> final-store drain is
- *                       aggregated per node: each node's leader rank copies
- *                       every rank's local staging files into a single
- *                       data.<node> sub-file on the final store. The number
- *                       of data sub-files (and drain progress records) scales
- *                       with the node count instead of the rank count, which
- *                       matters for the metadata servers and for readers on
- *                       very large jobs. Off critical path: aggregation runs
- *                       in the existing background drain workers. Must be
- *                       identical on every rank: it drives node collectives
- *                       at Open/EndStep, and a mismatch would deadlock or
- *                       silently miscompute offsets; it is validated
- *                       collectively at Open and a mismatch is reported as
- *                       an error. StripeSize (when > 1) aligns the node
- *                       sub-file's step base only; member slices within one
- *                       step are contiguous.
+ *                       co-write drain. Local staging stays per-rank
+ *                       (unchanged critical path), and the SSD ->
+ *                       final-store drain writes a single data.<node>
+ *                       sub-file per node that every rank on the node
+ *                       co-writes: each rank drains only its own staging
+ *                       slices, at the pre-assigned disjoint offsets of the
+ *                       shared sub-file, so the node gets one store client
+ *                       per rank instead of one for the whole node. The
+ *                       number of data sub-files (and final-store drain
+ *                       progress records: one per node, published by the
+ *                       node leader from the node-local per-rank records)
+ *                       scales with the node count instead of the rank
+ *                       count, which matters for the metadata servers and
+ *                       for readers on very large jobs. Off critical path:
+ *                       the co-write runs in the existing background drain
+ *                       workers. Must be identical on every rank: it drives
+ *                       node collectives at Open/EndStep, and a mismatch
+ *                       would deadlock or silently miscompute offsets; it
+ *                       is validated collectively at Open and a mismatch is
+ *                       reported as an error. StripeSize (when > 1) aligns
+ *                       the node sub-file's step base only; member slices
+ *                       within one step are contiguous.
  *
  * Environment variables (fallbacks for when the engine is reached through
  * middleware such as openPMD-api, which cannot pass engine parameters;
@@ -209,6 +215,9 @@ private:
     void RunCommitJob(const DrainJob &job);
     void WaitForAllRanksDrained(size_t step);
     void WriteProgress(uint64_t drainedSteps, uint64_t drainedBytes);
+    // aggregate co-write, called under m_Mutex:
+    void WriteLocalProgress(uint64_t drainedSteps, uint64_t drainedBytes); // every rank
+    void PublishNodeProgress(); // node leader only
     void CheckDrainError();
     void DrainAndCommitAll();
 
@@ -241,7 +250,9 @@ private:
     int m_NodeLocalRank = 0;        // rank within the node, ordered by global rank
     int m_NodeSize = 1;             // ranks on this node
     int m_NodeCount = 1;            // total nodes (known on every rank)
-    bool m_IsLeader = false;        // m_NodeLocalRank == 0: drains the node
+    bool m_IsLeader = false;        // m_NodeLocalRank == 0: publishes the node
+                                    // progress record (co-write: every rank
+                                    // drains its own slices)
     std::vector<int> m_NodeMembers; // global ranks on this node, ordered by global rank
     std::vector<uint64_t> m_NodeIndexPerRank; // rank 0: node id per writer (WriterMap)
 
@@ -258,9 +269,20 @@ private:
     // node-local burst buffer (cf. the original bbview's BBVIEW_TMP_DIR)
     std::string m_BurstBufferPath;
     std::string m_StagingDir;
+    // drain progress records (fixed-size seqlock, see BbstageDrainProgress).
+    // Non-aggregate: m_ProgressPath is this rank's record on the final store
+    // (finalDir/bbstage.drain.<rank>), published by this rank.
+    // Aggregate co-write: m_ProgressPath is the ONE node record on the final
+    // store (finalDir/bbstage.drain.<nodeId>), published by the node leader
+    // only; every rank additionally publishes its node-local record
+    // (m_LocalProgressPath, in the staging directory) which the leader folds
+    // into the node record.
     std::string m_ProgressPath;
-    int m_ProgressFd = -1; // raw fd to the fixed-size seqlock progress record
+    int m_ProgressFd = -1; // raw fd to the (node) progress record
     uint64_t m_ProgressSeq = 0;
+    std::string m_LocalProgressPath; // aggregate: node-local per-rank record
+    int m_LocalProgressFd = -1;
+    uint64_t m_LocalProgressSeq = 0;
     std::string m_Host;
 
     size_t m_WriterStep = 0;
@@ -283,7 +305,10 @@ private:
     std::thread m_CommitterThread;
     size_t m_NextDataSeq = 0;      // number of data jobs enqueued
     size_t m_DrainedWatermark = 0; // number of leading data jobs completed
-    uint64_t m_PublishedSteps = 0; // drain progress already written to the progress file
+    uint64_t m_PublishedSteps = 0; // drain progress already written to the
+                                   // (local) progress record
+    uint64_t m_PublishedNodeSteps = 0; // aggregate leader: steps already
+                                       // published in the node record
     std::set<size_t> m_DoneDataSeqs;
     size_t m_CommitEnqueued = 0;
     size_t m_CommitDone = 0;

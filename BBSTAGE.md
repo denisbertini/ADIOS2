@@ -45,10 +45,10 @@ The output is **standard BP5**: read it back with the stock `bp5` engine,
 |--------------------|---------|--------------------------------------------------------------------------------------------------|
 | `BurstBufferPath`  | `$TMPDIR` | Node-local staging directory (point it at the node's NVMe/SSD)                                |
 | `CloseMode`        | `durable` | `durable` or `staged` (see above)                                                              |
-| `StagingWatermarkMB` | `1024` | staged mode: cap on staged-but-undrained bytes; `EndStep` blocks above it until the concurrent drain catches up, then throws after `CommitTimeoutSecs` without drain progress (0 = unlimited). Per rank, or per node (x ranks/node) when `Aggregate` is on |
+| `StagingWatermarkMB` | `1024` | staged mode: cap on staged-but-undrained bytes; `EndStep` blocks above it until the concurrent drain catches up, then throws after `CommitTimeoutSecs` without drain progress (0 = unlimited). Per rank in both aggregation modes |
 | `DrainThreads`     | `1`     | drain worker threads per rank (run from `Open` in both close modes)                              |
 | `CommitTimeoutSecs`| `300`   | give up waiting on a stuck peer rank after this long (0 = forever); in staged mode also the stall timeout of the watermark backpressure |
-| `Aggregate`        | `off`   | `on`: node-aggregated drain. Local staging stays per-rank; the SSD -> final-store drain is aggregated per node into a single `data.<node>` sub-file (written by the node leader). Data sub-file count scales with node count, not rank count. Off critical path. Must be uniform across ranks |
+| `Aggregate`        | `off`   | `on`: node-aggregated co-write drain. Local staging stays per-rank; the SSD -> final-store drain writes one `data.<node>` sub-file per node that every rank on the node co-writes (each rank drains its own slices at pre-assigned disjoint offsets: one store client per rank, one file per node). Data sub-file count scales with node count, not rank count. Off critical path. Must be uniform across ranks |
 
 When bbstage is reached through middleware that cannot pass engine
 parameters (e.g. the WarpX checkpoint path via openPMD-api), these
@@ -63,22 +63,29 @@ Full parameter list, protocol semantics, and limitations:
 ## Notes
 
 - Write-only engine; the read side is the stock `bp5` engine. POSIX staging only.
-- **Aggregate drain** (`Aggregate=on`, branch `bbstage-aggregate-drain`):
-  motivated by metadata/file-count explosion at large rank counts. With the
-  stock per-rank layout, a job with R ranks writing S separate BP5 files
-  (e.g. WarpX's one-file-per-step) creates R x S data sub-files on the final
-  store; the parallel store's metadata servers and the post-processing readers
-  then have to deal with that many files. `Aggregate=on` keeps the fast
-  per-rank node-local staging (the app-visible critical path is unchanged) but
-  aggregates the decoupled SSD -> final-store drain per node: each node's
-  leader copies every rank's local staging files into one `data.<node>`
-  sub-file, so the data sub-file count scales with the node count, not the
-  rank count. The BP5 writer map routes every rank to its node's sub-file with
-  a pre-assigned intra-node offset (known at staging time, so the drain stays
-  a pure byte copy), and the rank-0 committer gates metadata commits on one
-  progress record per node. The output is still stock-BP5 readable. This is a
-  **scalability** feature (file count / metadata load), not a bandwidth win:
-  on an aggregate-bandwidth-capped Lustre the drain throughput is unchanged.
+- **Aggregate co-write drain** (`Aggregate=on`, branch
+  `bbstage-aggregate-drain`): motivated by metadata/file-count explosion at
+  large rank counts. With the stock per-rank layout, a job with R ranks
+  writing S separate BP5 files (e.g. WarpX's one-file-per-step) creates R x S
+  data sub-files on the final store; the parallel store's metadata servers and
+  the post-processing readers then have to deal with that many files.
+  `Aggregate=on` keeps the fast per-rank node-local staging (the
+  app-visible critical path is unchanged) and drains into one `data.<node>`
+  sub-file per node **co-written by every rank on the node**: each rank
+  drains only its own staging slices, at the pre-assigned disjoint offsets of
+  the shared sub-file, so the node gets one store client per rank. The BP5
+  writer map routes every rank to its node's sub-file with a pre-assigned
+  intra-node offset (known at staging time, so the drain stays a pure byte
+  copy), and the rank-0 committer gates metadata commits on one progress
+  record per node (the node leader folds the node's node-local per-rank
+  records into it). The output is still stock-BP5 readable.
+  Co-write is deliberate: a single drain client per node is capped at the
+  store's single-client write rate (~0.7 GiB/s measured on the RZ Lustre),
+  which in `staged` mode throttles the app back to the store rate and
+  destroys the staging win; one client per rank keeps the drain parallelism
+  of the non-aggregated layout at the file count of aggregate. The
+  multi-client single-file pattern is the same one BP5's own aggregator
+  chains use.
 - Design lineage: the staging + background-drain approach follows
   [BBView](https://github.com/tsukuba-hpcs/bbview) (Koyama & Tatebe,
   REX-IO 2025), implemented fully in-process. There is no view

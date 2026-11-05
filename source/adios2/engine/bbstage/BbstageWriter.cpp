@@ -502,8 +502,8 @@ void BbstageWriter::InitTransports()
     const std::string mdFile = GetBPMetadataFileName(m_Name);
     const std::string mmdFile = GetBPMetaMetadataFileNames({m_Name})[0];
     const std::string mdIdxFile = GetBPMetadataIndexFileName(m_Name);
-    // Aggregate mode: one data sub-file per node, named by the node id; the
-    // node leader is the only rank that writes it. Otherwise: one sub-file per
+    // Aggregate co-write mode: one data sub-file per node, named by the node
+    // id, co-written by every rank on the node. Otherwise: one sub-file per
     // writer rank (EveryoneWrites).
     m_DataFileName = m_Aggregate ? GetBPSubStreamName(m_Name, static_cast<size_t>(m_NodeIndex))
                                  : GetBPSubStreamName(m_Name, static_cast<size_t>(m_RankMPI));
@@ -541,16 +541,15 @@ void BbstageWriter::InitTransports()
     m_Comm.Barrier();
     openPhase("barrier1");
 
-    // final data sub-file: raw fd, only drain threads pwrite into it. In
-    // aggregate mode the node leader is the only rank that opens it (it drains
-    // every rank on the node); non-leaders keep m_DataFd = -1.
-    if (!(m_Aggregate && !m_IsLeader))
+    // final data sub-file: raw fd, only drain threads pwrite into it.
+    // Aggregate co-write: EVERY rank opens the shared data.<node> sub-file
+    // (O_CREAT from all is harmless: the first open creates, the rest attach)
+    // and drains only its own disjoint slices of it; the concurrent opens are
+    // safe because no two ranks ever write the same byte range.
+    m_DataFd = open(m_DataFileName.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (m_DataFd < 0)
     {
-        m_DataFd = open(m_DataFileName.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
-        if (m_DataFd < 0)
-        {
-            ThrowPosix("open of data sub-file " + m_DataFileName);
-        }
+        ThrowPosix("open of data sub-file " + m_DataFileName);
     }
     openPhase("data-fd");
 
@@ -588,17 +587,29 @@ void BbstageWriter::InitTransports()
     }
     m_Host = hostname;
 
-    // drain progress marker for this rank: a single fixed-size seqlock
-    // record. Created lazily by the first real progress update (first drain
-    // completion) instead of here: the initial create+write is a pure MDT
-    // round trip on the open critical path, and on the test cluster its stall
-    // tail (observed 0.1-2 s on Lustre) dominated Open. The committer treats
-    // a missing progress file as "progress 0", which is exactly the initial
+    // drain progress marker: a single fixed-size seqlock record. Created
+    // lazily by the first real progress update (first drain completion)
+    // instead of here: the initial create+write is a pure MDT round trip on
+    // the open critical path, and on the test cluster its stall tail
+    // (observed 0.1-2 s on Lustre) dominated Open. The committer treats a
+    // missing progress file as "progress 0", which is exactly the initial
     // state, so nothing depends on the file existing after Open.
-    // Aggregate mode: one progress record per node (bbstage.drain.<nodeId>),
-    // published by the node leader; otherwise one per writer rank.
-    const int progressId = m_Aggregate ? m_NodeIndex : m_RankMPI;
-    m_ProgressPath = finalDir + "/bbstage.drain." + std::to_string(progressId);
+    // Aggregate co-write: two tiers. Every rank publishes a node-local
+    // record in the staging directory (on the burst-buffer medium, so it is
+    // cheap); the node leader folds the node's records into the one node
+    // record on the final store (bbstage.drain.<nodeId>) that the rank-0
+    // committer reads. Non-aggregate: one record per writer rank on the
+    // final store, published by the rank itself.
+    if (m_Aggregate)
+    {
+        m_ProgressPath = finalDir + "/bbstage.drain." + std::to_string(m_NodeIndex);
+        m_LocalProgressPath =
+            m_StagingDir + "/bbstage.drain." + std::to_string(m_RankMPI);
+    }
+    else
+    {
+        m_ProgressPath = finalDir + "/bbstage.drain." + std::to_string(m_RankMPI);
+    }
     openPhase("progress-file");
     m_MetaDataPos = 0; // BP5 md.0 carries no header in this format version
 
@@ -612,16 +623,11 @@ void BbstageWriter::InitTransports()
         // session to the process-level finalizer, which commits the
         // metadata and drains the remainder while the application computes.
         // Workers only: the commit stays deferred to the finalizer, so no
-        // rank-0 committer thread starts here.
-        // Aggregate mode: the watermark is a per-node budget (the leader
-        // tracks the node's total staged-but-undrained bytes), so scale the
-        // per-rank setting by the number of ranks on this node.
-        // m_NodeSize is m_NodeComm.Size() and therefore >= 1.
-        const uint64_t watermark =
-            m_Aggregate ? m_StagingWatermarkBytes * static_cast<uint64_t>(m_NodeSize)
-                        : m_StagingWatermarkBytes;
+        // rank-0 committer thread starts here. The watermark is per rank in
+        // both aggregation modes (aggregate co-write: every rank drains its
+        // own bytes, so every rank gates itself).
         auto &finalizer = BbstageStagedFinalizer::Instance();
-        finalizer.SetStagingWatermark(watermark);
+        finalizer.SetStagingWatermark(m_StagingWatermarkBytes);
         finalizer.SetStagingStallTimeout(m_CommitTimeoutSecs);
         StartDrainWorkers();
     }
@@ -699,10 +705,12 @@ void BbstageWriter::EndStep()
 
     if (m_Aggregate)
     {
-        // The node leader holds the node data sub-file's append position.
-        // Align it and broadcast it to the node: every rank derives its own
-        // intra-node offset from it, so the offsets are final at staging time
-        // and the drain stays a pure byte copy (the bbstage invariant).
+        // Co-write: every rank drains its own slice of the shared node
+        // sub-file, so the slice offsets must be final at staging time (the
+        // bbstage invariant). The node leader holds the sub-file's append
+        // position; align it and broadcast it to the node, then allgather
+        // the per-rank step sizes: every rank derives its own intra-node
+        // offset from (nodeFilePos, sizes).
         nodeFilePos = m_DataPos;
         if (m_Parameters.StripeSize > 1)
         {
@@ -726,13 +734,12 @@ void BbstageWriter::EndStep()
         if (m_IsLeader)
         {
             m_DataPos = nodeFilePos + prefix; // prefix == this step's node total
-            // Backpressure: the leader gates the whole node (its drain jobs
-            // carry the node total); non-leaders rely on that gate (step
-            // progression is collective). Durable mode needs no such guard.
-            if (m_CloseModeStaged)
-            {
-                BbstageStagedFinalizer::Instance().AccountStaged(prefix);
-            }
+        }
+        // Backpressure, per rank (co-write: every rank drains its own
+        // bytes). Durable mode needs no guard.
+        if (m_CloseModeStaged)
+        {
+            BbstageStagedFinalizer::Instance().AccountStaged(dataSize);
         }
     }
     else
@@ -773,65 +780,29 @@ void BbstageWriter::EndStep()
     delete TSInfo.DataBuffer;
     TSInfo.DataBuffer = nullptr;
 
-    // Aggregate: the node leader's drain worker reads every rank's staging
-    // file, so all of them must be written before the job is handed off. This
-    // node-local barrier guarantees that (everyone on the node calls it).
-    if (m_Aggregate)
-    {
-        m_NodeComm.Barrier();
-    }
-
+    // No barrier: co-write aggregate drains each rank's own staging file
+    // (written above) into its own slice; non-aggregate is per-rank by
+    // construction.
     if (!m_Aggregate)
     {
         m_DataPos = finalPos + dataSize;
     }
 
     // Hand off to the in-process drain workers (original bbview: xattr +
-    // socket message to bbviewd).
-    if (m_Aggregate)
+    // socket message to bbviewd). Both modes enqueue one single-slice job per
+    // rank: in aggregate co-write mode the slice is this rank's pre-assigned
+    // offset range in the shared node sub-file.
+    DrainJob job;
+    job.Seq = m_NextDataSeq++;
+    job.Step = m_WriterStep;
+    job.StagingPath = stagingPath;
+    job.FinalPos = finalPos;
+    job.DataSize = dataSize;
     {
-        // Only the leader enqueues: one job that drains every rank on the node
-        // into the shared node sub-file. Non-leaders stage locally and let the
-        // leader drain their files.
-        if (m_IsLeader)
-        {
-            DrainJob job;
-            job.Seq = m_NextDataSeq++;
-            job.Step = m_WriterStep;
-            uint64_t prefix = 0;
-            for (int l = 0; l < m_NodeSize; ++l)
-            {
-                BbstageDrainMember mem;
-                mem.StagingPath = m_StagingDir + "/step_r" +
-                                  std::to_string(m_NodeMembers[static_cast<size_t>(l)]) + "_" +
-                                  std::to_string(m_WriterStep);
-                mem.FinalPos = nodeFilePos + prefix;
-                mem.DataSize = nodeSizes[static_cast<size_t>(l)];
-                prefix += nodeSizes[static_cast<size_t>(l)];
-                job.Members.push_back(std::move(mem));
-            }
-            job.DataSize = prefix; // node total (drain watermark / progress)
-            {
-                std::lock_guard<std::mutex> lck(m_Mutex);
-                m_DataQueue.push_back(std::move(job));
-            }
-            m_DataCV.notify_one();
-        }
+        std::lock_guard<std::mutex> lck(m_Mutex);
+        m_DataQueue.push_back(std::move(job));
     }
-    else
-    {
-        DrainJob job;
-        job.Seq = m_NextDataSeq++;
-        job.Step = m_WriterStep;
-        job.StagingPath = stagingPath;
-        job.FinalPos = finalPos;
-        job.DataSize = dataSize;
-        {
-            std::lock_guard<std::mutex> lck(m_Mutex);
-            m_DataQueue.push_back(std::move(job));
-        }
-        m_DataCV.notify_one();
-    }
+    m_DataCV.notify_one();
 
     // Collective, small: aggregate this step's metadata and queue its commit
     // on rank 0. The commit only becomes visible once the data has drained.
@@ -877,14 +848,11 @@ void BbstageWriter::NotifyEngineAttribute(std::string /*name*/, AttributeBase *A
 
 void BbstageWriter::StartDrainWorkers()
 {
-    // Aggregate mode: only the node leader drains (it copies every rank on the
-    // node); non-leaders have no data to drain, so they start no workers.
-    if (!(m_Aggregate && !m_IsLeader))
+    // Every rank drains its own slices, including in aggregate co-write mode
+    // (each rank writes its own offsets of the shared node sub-file).
+    for (unsigned int i = 0; i < m_DrainThreads; ++i)
     {
-        for (unsigned int i = 0; i < m_DrainThreads; ++i)
-        {
-            m_DrainWorkers.emplace_back(&BbstageWriter::WorkerLoop, this);
-        }
+        m_DrainWorkers.emplace_back(&BbstageWriter::WorkerLoop, this);
     }
 }
 
@@ -921,14 +889,33 @@ void BbstageWriter::StopDrainThreads() noexcept
 
 void BbstageWriter::WorkerLoop()
 {
+    // Aggregate co-write: the node leader's node record lags its own queue
+    // whenever sibling ranks drain slower than it; sibling completions never
+    // notify this worker (they only write their node-local records), so the
+    // leader must keep publishing on a timer until the node's last enqueued
+    // step is fully drained.
+    const auto nodePublishPending = [this] {
+        return m_Aggregate && m_IsLeader && m_PublishedNodeSteps < m_NextDataSeq;
+    };
     for (;;)
     {
         DrainJob job;
+        bool haveJob = false;
         {
             std::unique_lock<std::mutex> lck(m_Mutex);
-            m_DataCV.wait(lck, [this] {
-                return m_Finishing || m_DrainError != nullptr || !m_DataQueue.empty();
-            });
+            if (nodePublishPending())
+            {
+                m_DataCV.wait_for(lck, std::chrono::milliseconds(m_CommitPollMs), [this, &nodePublishPending] {
+                    return m_Finishing || m_DrainError != nullptr || !m_DataQueue.empty() ||
+                           nodePublishPending();
+                });
+            }
+            else
+            {
+                m_DataCV.wait(lck, [this] {
+                    return m_Finishing || m_DrainError != nullptr || !m_DataQueue.empty();
+                });
+            }
             // Stop: the leftover queue is not this worker's to drain. Durable
             // Close() drains it synchronously (DrainAndCommitAll) before
             // stopping the threads; staged Close() hands it to the finalizer
@@ -938,8 +925,34 @@ void BbstageWriter::WorkerLoop()
             {
                 return;
             }
-            job = std::move(m_DataQueue.front());
-            m_DataQueue.pop_front();
+            if (!m_DataQueue.empty())
+            {
+                job = std::move(m_DataQueue.front());
+                m_DataQueue.pop_front();
+                haveJob = true;
+            }
+            else if (nodePublishPending())
+            {
+                // Own queue empty but the node record is behind: fold the
+                // siblings' node-local records now (under the lock).
+                try
+                {
+                    PublishNodeProgress();
+                }
+                catch (...)
+                {
+                    if (!m_DrainError)
+                    {
+                        m_DrainError = std::current_exception();
+                    }
+                }
+            }
+        }
+        if (!haveJob)
+        {
+            m_DataCV.notify_all();
+            m_CommitCV.notify_all();
+            continue;
         }
 
         try
@@ -973,19 +986,41 @@ void BbstageWriter::WorkerLoop()
             {
                 const uint64_t publishSteps = m_DrainedWatermark;
                 const uint64_t publishBytes = m_ProgressBytes;
-                // Aggregate mode: this job drained every member of the node,
-                // so publishing progress here means all of the node's data is
-                // on the final store. This is the invariant the rank-0
-                // committer relies on when it gates commits on node progress
-                // records.
                 // Publish under the lock so sequence numbers stay serialized
                 // across drain threads; the update itself is one small
                 // pwrite. m_PublishedSteps is only advanced after a
                 // successful write, so a failing publish stays retryable.
+                // Aggregate co-write: this rank's record is node-local (the
+                // node leader folds it into the node record); otherwise the
+                // record goes straight to the final store, where the rank-0
+                // committer reads it.
                 try
                 {
-                    WriteProgress(publishSteps, publishBytes);
+                    if (m_Aggregate)
+                    {
+                        WriteLocalProgress(publishSteps, publishBytes);
+                    }
+                    else
+                    {
+                        WriteProgress(publishSteps, publishBytes);
+                    }
                     m_PublishedSteps = publishSteps;
+                }
+                catch (...)
+                {
+                    if (!m_DrainError)
+                    {
+                        m_DrainError = std::current_exception();
+                    }
+                }
+            }
+            if (m_Aggregate && m_IsLeader)
+            {
+                // Fold the node's local records into the node record (no-op
+                // when the node's drained minimum has not advanced).
+                try
+                {
+                    PublishNodeProgress();
                 }
                 catch (...)
                 {
@@ -1011,9 +1046,9 @@ void BbstageWriter::WorkerLoop()
 
 void BbstageWriter::RunDataJob(DrainJob &job)
 {
-    // Copy one staging file into the (node) data sub-file at its final offset.
-    // In aggregate mode the leader calls this once per node member; otherwise
-    // once for this rank's own slice.
+    // Copy this rank's staging file into the data sub-file at its final
+    // offset. Aggregate co-write: the offset is this rank's pre-assigned
+    // range in the shared node sub-file; no two ranks write the same bytes.
     auto drainOne = [this](const std::string &stagingPath, uint64_t finalPos, size_t dataSize) {
         const int sfd = open(stagingPath.c_str(), O_RDONLY | O_CLOEXEC);
         if (sfd < 0)
@@ -1074,23 +1109,12 @@ void BbstageWriter::RunDataJob(DrainJob &job)
         }
     };
 
-    if (!job.Members.empty())
-    {
-        for (auto &mem : job.Members)
-        {
-            drainOne(mem.StagingPath, mem.FinalPos, mem.DataSize);
-        }
-    }
-    else
-    {
-        drainOne(job.StagingPath, job.FinalPos, job.DataSize);
-    }
+    drainOne(job.StagingPath, job.FinalPos, job.DataSize);
 
     if (m_Parameters.verbose > 2)
     {
-        const size_t nSlices = job.Members.empty() ? 1 : job.Members.size();
         std::cout << "bbstage rank " << m_RankMPI << " drained step " << job.Step << " ("
-                  << job.DataSize << " bytes, " << nSlices << " slice(s))\n";
+                  << job.DataSize << " bytes)\n";
     }
 }
 
@@ -1206,11 +1230,14 @@ void BbstageWriter::WaitForAllRanksDrained(size_t step)
     }
 
     // remote peers via their atomically-updated progress files. Aggregate
-    // mode: one progress record per node (bbstage.drain.<nodeId>), so gate on
-    // the other nodes; otherwise one per writer rank. This rank (0) is always
-    // its node's leader, so its own node is covered by the in-memory check above.
+    // co-write mode: one node record per node (bbstage.drain.<nodeId>),
+    // published by each node's leader from the node-local per-rank records;
+    // gate on ALL nodes, including this rank's own -- in co-write mode the
+    // in-memory check above covers only this rank's own slices, not its
+    // node's. Non-aggregate: one record per writer rank, and this rank (0)
+    // is covered by the in-memory check above.
     const int size = m_Aggregate ? m_NodeCount : m_Comm.Size();
-    for (int r = 1; r < size; ++r)
+    for (int r = (m_Aggregate ? 0 : 1); r < size; ++r)
     {
         const std::string path = m_Name + "/bbstage.drain." + std::to_string(r);
         for (;;)
@@ -1242,7 +1269,8 @@ void BbstageWriter::WaitForAllRanksDrained(size_t step)
                 helper::Throw<std::runtime_error>("Engine", "BbstageWriter",
                                                   "WaitForAllRanksDrained",
                                                   "timeout waiting for drain of step " +
-                                                      std::to_string(step) + " on rank " +
+                                                      std::to_string(step) + " on " +
+                                                      (m_Aggregate ? "node " : "rank ") +
                                                       std::to_string(r) + " (progress: " +
                                                       (BbstageReadProgress(path, p)
                                                            ? std::to_string(p.DrainedSteps) + " steps"
@@ -1271,6 +1299,93 @@ void BbstageWriter::WriteProgress(uint64_t drainedSteps, uint64_t drainedBytes)
     }
     BbstageWriteProgressRecord(m_ProgressFd, m_ProgressPath, static_cast<uint64_t>(m_RankMPI),
                               drainedSteps, drainedBytes, m_ProgressSeq, m_Host);
+}
+
+void BbstageWriter::WriteLocalProgress(uint64_t drainedSteps, uint64_t drainedBytes)
+{
+    // Aggregate co-write: this rank's node-local drain record (in the
+    // staging directory, on the burst-buffer medium). The node leader folds
+    // it into the node record; nobody on the final store reads it.
+    // Called under m_Mutex, so no two threads can race the lazy create.
+    if (m_LocalProgressFd < 0)
+    {
+        m_LocalProgressFd =
+            open(m_LocalProgressPath.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (m_LocalProgressFd < 0)
+        {
+            ThrowPosix("create local progress file " + m_LocalProgressPath + " (rank " +
+                       std::to_string(m_RankMPI) + ", host " + m_Host + ")");
+        }
+    }
+    BbstageWriteProgressRecord(m_LocalProgressFd, m_LocalProgressPath,
+                               static_cast<uint64_t>(m_RankMPI), drainedSteps, drainedBytes,
+                               m_LocalProgressSeq, m_Host);
+}
+
+void BbstageWriter::PublishNodeProgress()
+{
+    // Aggregate co-write: fold every rank's node-local progress record into
+    // the one node record on the final store. The node record reports the
+    // node's drained minimum (steps) and summed drained bytes; a record
+    // reporting N steps therefore guarantees that all N steps of every rank
+    // on this node are on the final store -- the invariant the rank-0
+    // committer gates on.
+    // Called under m_Mutex; only the node leader does this.
+    uint64_t minSteps = m_DrainedWatermark; // own watermark (in memory)
+    uint64_t sumBytes = m_ProgressBytes;
+    for (const int member : m_NodeMembers)
+    {
+        if (member == m_RankMPI)
+        {
+            continue;
+        }
+        BbstageDrainProgress p;
+        if (BbstageReadProgress(m_StagingDir + "/bbstage.drain." + std::to_string(member), p))
+        {
+            minSteps = std::min(minSteps, p.DrainedSteps);
+            sumBytes += p.DrainedBytes;
+        }
+        else
+        {
+            minSteps = 0; // sibling has not drained anything yet (or is dead)
+        }
+    }
+    if (minSteps <= m_PublishedNodeSteps)
+    {
+        return;
+    }
+    if (m_ProgressFd < 0)
+    {
+        m_ProgressFd =
+            open(m_ProgressPath.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (m_ProgressFd < 0)
+        {
+            ThrowPosix("create node progress file " + m_ProgressPath + " (node " +
+                       std::to_string(m_NodeIndex) + ", rank " + std::to_string(m_RankMPI) +
+                       ", host " + m_Host + ")");
+        }
+    }
+    BbstageWriteProgressRecord(m_ProgressFd, m_ProgressPath, static_cast<uint64_t>(m_RankMPI),
+                               minSteps, sumBytes, m_ProgressSeq, m_Host);
+    m_PublishedNodeSteps = minSteps;
+    if (minSteps >= m_NextDataSeq)
+    {
+        // Node fully drained: the node-local records have served their
+        // purpose. The leader is the only actor that may remove them -- a
+        // sibling removing its own record before the node is full would read
+        // back as "0 steps" and stall the node record forever -- and it
+        // removes them here, in the same critical section as the final node
+        // record publish, so the node record can never be left folded from
+        // records that no longer exist. The staging dir goes with them when
+        // it is empty (all staging files were removed by their owners as
+        // they drained).
+        std::error_code ec;
+        for (const int member : m_NodeMembers)
+        {
+            std::filesystem::remove(m_StagingDir + "/bbstage.drain." + std::to_string(member), ec);
+        }
+        std::filesystem::remove(m_StagingDir, ec); // best effort: succeeds only if empty
+    }
 }
 
 void BbstageWriter::CheckDrainError()
@@ -1810,6 +1925,16 @@ void BbstageWriter::DoClose(const int /*transportIndex*/)
         session.ProgressFd = m_ProgressFd;
         m_ProgressFd = -1;
         session.ProgressSeq = m_ProgressSeq;
+        session.LocalProgressPath = m_LocalProgressPath;
+        session.LocalProgressFd = m_LocalProgressFd;
+        m_LocalProgressFd = -1;
+        session.LocalProgressSeq = m_LocalProgressSeq;
+        session.IsNodeLeader = m_Aggregate && m_IsLeader;
+        if (m_Aggregate)
+        {
+            session.NodeMembers = m_NodeMembers;
+        }
+        session.NodePublishedSteps = m_PublishedNodeSteps;
         session.MDFile = std::move(m_MDFile);
         session.MMDFile = std::move(m_MMDFile);
         session.MDIndexFile = std::move(m_MDIndexFile);
@@ -1951,6 +2076,11 @@ void BbstageWriter::DestructorClose(bool /*Verbose*/) noexcept
     {
         close(m_ProgressFd);
         m_ProgressFd = -1;
+    }
+    if (m_LocalProgressFd >= 0)
+    {
+        close(m_LocalProgressFd);
+        m_LocalProgressFd = -1;
     }
     m_IsOpen = false;
 }

@@ -240,10 +240,20 @@ void BbstageStagedFinalizer::CompleteSessionData(Session &s)
     // rank-0 committer polls it (it may start polling after this rank's
     // drain already finished), and a removed file is indistinguishable from
     // "no progress". FinalizeSession() removes it once the last commit is
-    // done.
+    // done. Aggregate co-write: the node-local records live until the node
+    // leader removes them at node-full (see PublishNodeRecord); this rank
+    // only closes its own fd.
+    if (s.LocalProgressFd >= 0)
+    {
+        close(s.LocalProgressFd);
+        s.LocalProgressFd = -1;
+    }
     std::error_code ec;
     if (!s.StagingDir.empty())
     {
+        // Aggregate co-write: this can fail while the node's local records
+        // still exist (the leader removes them, with the dir, at node-full);
+        // best effort.
         std::filesystem::remove(s.StagingDir, ec); // succeeds only if empty
     }
     if (s.Verbose > 1)
@@ -298,9 +308,9 @@ BbstageStagedFinalizer::~BbstageStagedFinalizer()
 
 void BbstageStagedFinalizer::RunDataJob(Session &s, BbstageDrainJob &job)
 {
-    // Copy one staging file into the (node) data sub-file at its final offset.
-    // Aggregate mode: the leader calls this once per node member; otherwise
-    // once for this rank's own slice.
+    // Copy this rank's staging file into the data sub-file at its final
+    // offset. Aggregate co-write: the offset is this rank's pre-assigned
+    // range in the shared node sub-file; no two ranks write the same bytes.
     auto drainOne = [&](const std::string &stagingPath, uint64_t finalPos, size_t dataSize) {
         const int sfd = open(stagingPath.c_str(), O_RDONLY | O_CLOEXEC);
         if (sfd < 0)
@@ -356,24 +366,12 @@ void BbstageStagedFinalizer::RunDataJob(Session &s, BbstageDrainJob &job)
         }
     };
 
-    if (!job.Members.empty())
-    {
-        for (auto &mem : job.Members)
-        {
-            drainOne(mem.StagingPath, mem.FinalPos, mem.DataSize);
-        }
-    }
-    else
-    {
-        drainOne(job.StagingPath, job.FinalPos, job.DataSize);
-    }
+    drainOne(job.StagingPath, job.FinalPos, job.DataSize);
 
     if (s.Verbose > 2)
     {
-        const size_t nSlices = job.Members.empty() ? 1 : job.Members.size();
         std::cout << "bbstage finalizer rank " << s.Rank << " drained step " << job.Step
-                  << " (" << job.DataSize << " bytes, " << nSlices << " slice(s)) of " << s.FinalDir
-                  << "\n";
+                  << " (" << job.DataSize << " bytes) of " << s.FinalDir << "\n";
     }
 }
 
@@ -395,8 +393,115 @@ void BbstageStagedFinalizer::PublishProgress(Session &s)
                               s.DrainedWatermark, s.ProgressBytes, s.ProgressSeq, s.Host);
 }
 
+void BbstageStagedFinalizer::PublishLocalProgress(Session &s)
+{
+    // Aggregate co-write: this rank's node-local drain record (in the
+    // staging directory, on the burst-buffer medium). The node leader folds
+    // it into the node record; nobody on the final store reads it.
+    // Called under m_Mutex.
+    if (s.LocalProgressFd < 0)
+    {
+        s.LocalProgressFd = open(s.LocalProgressPath.c_str(), O_RDWR | O_CREAT | O_TRUNC |
+                                         O_CLOEXEC,
+                                 0644);
+        if (s.LocalProgressFd < 0)
+        {
+            ThrowPosix("create local progress file " + s.LocalProgressPath + " (rank " +
+                       std::to_string(s.Rank) + ", host " + s.Host + ")");
+        }
+    }
+    BbstageWriteProgressRecord(s.LocalProgressFd, s.LocalProgressPath,
+                               static_cast<uint64_t>(s.Rank), s.DrainedWatermark, s.ProgressBytes,
+                               s.LocalProgressSeq, s.Host);
+}
+
+void BbstageStagedFinalizer::PublishNodeRecord(Session &s)
+{
+    // Aggregate co-write: fold every rank's node-local progress record into
+    // the one node record on the final store. The node record reports the
+    // node's drained minimum (steps) and summed drained bytes; a record
+    // reporting N steps therefore guarantees that all N steps of every rank
+    // on this node are on the final store -- the invariant the rank-0
+    // committer gates on.
+    // Called under m_Mutex; only the node leader does this.
+    uint64_t minSteps = s.DrainedWatermark; // own watermark (in memory)
+    uint64_t sumBytes = s.ProgressBytes;
+    for (const int member : s.NodeMembers)
+    {
+        if (member == s.Rank)
+        {
+            continue;
+        }
+        BbstageDrainProgress p;
+        if (BbstageReadProgress(s.StagingDir + "/bbstage.drain." + std::to_string(member), p))
+        {
+            minSteps = std::min(minSteps, p.DrainedSteps);
+            sumBytes += p.DrainedBytes;
+        }
+        else
+        {
+            minSteps = 0; // sibling has not drained anything yet (or is dead)
+        }
+    }
+    if (minSteps <= s.NodePublishedSteps)
+    {
+        return;
+    }
+    if (s.ProgressFd < 0)
+    {
+        // No O_TRUNC: the fd may have been closed by CompleteSessionData
+        // while the node record still has content, and a record is always a
+        // full 56-byte write at offset 0 anyway.
+        s.ProgressFd = open(s.ProgressPath.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+        if (s.ProgressFd < 0)
+        {
+            ThrowPosix("create node progress file " + s.ProgressPath + " (rank " +
+                       std::to_string(s.Rank) + ", host " + s.Host + ")");
+        }
+    }
+    BbstageWriteProgressRecord(s.ProgressFd, s.ProgressPath, static_cast<uint64_t>(s.Rank),
+                               minSteps, sumBytes, s.ProgressSeq, s.Host);
+    s.NodePublishedSteps = minSteps;
+    if (minSteps >= s.NextDataSeq)
+    {
+        // Node fully drained: the node-local records have served their
+        // purpose. The leader is the only actor that may remove them -- a
+        // sibling removing its own record before the node is full would read
+        // back as "0 steps" and stall the node record forever -- and it
+        // removes them here, in the same critical section as the final node
+        // record publish. The staging dir goes with them when it is empty
+        // (all staging files were removed by their owners as they drained).
+        std::error_code ec;
+        for (const int member : s.NodeMembers)
+        {
+            std::filesystem::remove(s.StagingDir + "/bbstage.drain." + std::to_string(member), ec);
+        }
+        std::filesystem::remove(s.StagingDir, ec); // best effort: succeeds only if empty
+    }
+}
+
+void BbstageStagedFinalizer::EraseDoneSessions()
+{
+    // Called under m_Mutex. An aggregate node leader session is kept while
+    // its node record is still behind (NodePublishedSteps < NextDataSeq):
+    // the leader must keep folding and publishing until the whole node has
+    // drained, even after its own queue is empty.
+    m_Sessions.erase(std::remove_if(m_Sessions.begin(), m_Sessions.end(),
+                                    [this](const std::shared_ptr<Session> &x) {
+                                        return x->DataDone && (m_Rank != 0 || x->Finalized) &&
+                                               !(x->Aggregate && x->IsNodeLeader &&
+                                                 x->NodePublishedSteps < x->NextDataSeq);
+                                    }),
+                     m_Sessions.end());
+}
+
 void BbstageStagedFinalizer::DrainWorkerLoop()
 {
+    // stall tracking for the aggregate node leader's node record publish
+    // (see the idle path below)
+    std::shared_ptr<Session> stallSession;
+    uint64_t stallSteps = 0;
+    std::chrono::steady_clock::time_point stallStart = std::chrono::steady_clock::now();
     for (;;)
     {
         std::shared_ptr<Session> s;
@@ -404,13 +509,40 @@ void BbstageStagedFinalizer::DrainWorkerLoop()
         bool have = false;
         {
             std::unique_lock<std::mutex> lck(m_Mutex);
-            m_DataCV.wait(lck, [this] {
-                return m_Error != nullptr || m_Finishing ||
-                       std::any_of(m_Sessions.begin(), m_Sessions.end(),
-                                   [](const std::shared_ptr<Session> &x) {
-                                       return !x->DataQueue.empty();
-                                   });
-            });
+            const bool nodePublishPending =
+                std::any_of(m_Sessions.begin(), m_Sessions.end(),
+                            [](const std::shared_ptr<Session> &x) {
+                                return x->Aggregate && x->IsNodeLeader &&
+                                       x->NodePublishedSteps < x->NextDataSeq;
+                            });
+            if (nodePublishPending)
+            {
+                // Sibling ranks' drain completions never notify this worker
+                // (they only write their node-local records), so an aggregate
+                // node leader must keep publishing the node record on a timer
+                // until the whole node has drained, even with an empty queue.
+                m_DataCV.wait_for(lck, std::chrono::milliseconds(2),
+                                  [this, &nodePublishPending] {
+                                      return m_Error != nullptr || m_Finishing ||
+                                             std::any_of(m_Sessions.begin(), m_Sessions.end(),
+                                                         [](const std::shared_ptr<Session> &x) {
+                                                             return !x->DataQueue.empty() ||
+                                                                    (x->Aggregate && x->IsNodeLeader &&
+                                                                     x->NodePublishedSteps <
+                                                                         x->NextDataSeq);
+                                                         });
+                                  });
+            }
+            else
+            {
+                m_DataCV.wait(lck, [this] {
+                    return m_Error != nullptr || m_Finishing ||
+                           std::any_of(m_Sessions.begin(), m_Sessions.end(),
+                                       [](const std::shared_ptr<Session> &x) {
+                                           return !x->DataQueue.empty();
+                                       });
+                });
+            }
             if (m_Error)
             {
                 return;
@@ -429,13 +561,78 @@ void BbstageStagedFinalizer::DrainWorkerLoop()
                 s->DataQueue.pop_front();
                 have = true;
             }
-            else if (m_Finishing)
+            else
             {
-                return; // process exiting and nothing left to drain
+                // No job to drain. An aggregate node leader whose node record
+                // is behind still has work: fold the node-local records and
+                // publish (self-gating: no-op when the minimum has not
+                // advanced).
+                bool published = false;
+                for (const auto &x : m_Sessions)
+                {
+                    if (x->Aggregate && x->IsNodeLeader && x->NodePublishedSteps < x->NextDataSeq)
+                    {
+                        try
+                        {
+                            PublishNodeRecord(*x);
+                            // Stall detection: a sibling that dies stops its
+                            // node-local record from advancing, and the node
+                            // minimum can never reach the session's last
+                            // step. Fail with an error after
+                            // CommitTimeoutSecs without progress instead of
+                            // polling forever (at process exit the
+                            // destructor would otherwise block on this
+                            // worker).
+                            if (stallSession != x)
+                            {
+                                stallSession = x;
+                                stallSteps = x->NodePublishedSteps;
+                                stallStart = std::chrono::steady_clock::now();
+                            }
+                            else if (x->NodePublishedSteps != stallSteps)
+                            {
+                                stallSteps = x->NodePublishedSteps;
+                                stallStart = std::chrono::steady_clock::now();
+                            }
+                            else if (x->CommitTimeoutSecs > 0.f &&
+                                     (std::chrono::steady_clock::now() - stallStart) >
+                                         std::chrono::duration_cast<
+                                             std::chrono::steady_clock::duration>(
+                                             std::chrono::duration<float>(x->CommitTimeoutSecs)))
+                            {
+                                throw std::runtime_error(
+                                    "bbstage finalizer: node progress of " + x->FinalDir +
+                                    " stuck at " + std::to_string(x->NodePublishedSteps) +
+                                    " of " + std::to_string(x->NextDataSeq) + " steps for " +
+                                    std::to_string(x->CommitTimeoutSecs) +
+                                    " s: a sibling rank on this node is not draining "
+                                    "(dead or stalled)");
+                            }
+                        }
+                        catch (...)
+                        {
+                            if (!m_Error)
+                            {
+                                m_Error = std::current_exception();
+                            }
+                        }
+                        published = true;
+                    }
+                }
+                if (published)
+                {
+                    EraseDoneSessions(); // a just-completed node may release its session
+                }
+                if (m_Finishing && !published)
+                {
+                    return; // process exiting and nothing left to drain or publish
+                }
             }
         }
         if (!have)
         {
+            m_DataCV.notify_all();
+            m_CommitCV.notify_all();
             continue;
         }
 
@@ -472,8 +669,25 @@ void BbstageStagedFinalizer::DrainWorkerLoop()
                 s->ProgressBytes += job.DataSize;
                 if (s->DrainedWatermark > s->PublishedSteps)
                 {
-                    PublishProgress(*s);
+                    // Aggregate co-write: this rank's record is node-local
+                    // (the node leader folds it into the node record);
+                    // otherwise the record goes straight to the final store.
+                    if (s->Aggregate)
+                    {
+                        PublishLocalProgress(*s);
+                    }
+                    else
+                    {
+                        PublishProgress(*s);
+                    }
                     s->PublishedSteps = s->DrainedWatermark;
+                }
+                if (s->Aggregate && s->IsNodeLeader)
+                {
+                    // Fold the node's local records into the node record
+                    // (no-op when the node's drained minimum has not
+                    // advanced).
+                    PublishNodeRecord(*s);
                 }
                 if (m_PendingStaged >= job.DataSize)
                 {
@@ -496,15 +710,13 @@ void BbstageStagedFinalizer::DrainWorkerLoop()
                 // outside the lock: data-side session cleanup (single actor)
                 CompleteSessionData(*s);
                 // release sessions fully done on this rank (rank != 0 has no
-                // commit worker, so this worker is the only reclaimer there)
+                // commit worker, so this worker is the only reclaimer there);
+                // an aggregate node leader session is kept while its node
+                // record is still behind (it must keep publishing until the
+                // whole node has drained)
                 {
                     std::lock_guard<std::mutex> lck(m_Mutex);
-                    m_Sessions.erase(std::remove_if(m_Sessions.begin(), m_Sessions.end(),
-                                                    [this](const std::shared_ptr<Session> &x) {
-                                                        return x->DataDone &&
-                                                               (m_Rank != 0 || x->Finalized);
-                                                    }),
-                                     m_Sessions.end());
+                    EraseDoneSessions();
                 }
             }
         }
@@ -579,12 +791,13 @@ void BbstageStagedFinalizer::WaitForSessionDrained(Session &s, size_t step)
     }
 
     // remote peers via their atomically-updated progress files (the committer
-    // only exists on rank 0, so ranks 1..WriterCount-1 are the peers). Aggregate
-    // mode: one progress record per node, so gate on the other nodes. Rank 0 is
-    // always its node's leader, so its own node is covered by the in-memory
-    // check above.
+    // only exists on rank 0, so ranks 1..WriterCount-1 are the peers).
+    // Aggregate co-write mode: one node record per node, published by each
+    // node's leader from the node-local per-rank records; gate on ALL nodes,
+    // including rank 0's own -- in co-write mode the in-memory check above
+    // covers only rank 0's own slices, not its node's.
     const int peers = s.Aggregate ? s.NodeCount : s.WriterCount;
-    for (int r = 1; r < peers; ++r)
+    for (int r = (s.Aggregate ? 0 : 1); r < peers; ++r)
     {
         const std::string path = s.FinalDir + "/bbstage.drain." + std::to_string(r);
         for (;;)
@@ -604,7 +817,8 @@ void BbstageStagedFinalizer::WaitForSessionDrained(Session &s, size_t step)
             if (!forever && (std::chrono::steady_clock::now() - start) > timeout)
             {
                 throw std::runtime_error("bbstage finalizer: timeout waiting for drain of "
-                                         "step " + std::to_string(step) + " on rank " +
+                                         "step " + std::to_string(step) +
+                                         (s.Aggregate ? " on node " : " on rank ") +
                                          std::to_string(r) + " (progress: " +
                                          (BbstageReadProgress(path, p)
                                               ? std::to_string(p.DrainedSteps) + " steps"

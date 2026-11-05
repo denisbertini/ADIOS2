@@ -29,28 +29,17 @@ namespace engine
  * Shared by the engine (durable close mode) and the process-level finalizer
  * (staged close mode, BbstageStagedFinalizer). */
 
-/** One rank's slice of a node-aggregated drain job (Aggregate mode). The
- * node leader copies this rank's staging file into the shared node data
- * sub-file at FinalPos. */
-struct BbstageDrainMember
-{
-    std::string StagingPath;
-    uint64_t FinalPos = 0; // offset of this rank's slice in the node sub-file
-    size_t DataSize = 0;
-};
-
 struct BbstageDrainJob
 {
     size_t Seq = 0; // data job sequence number (one data job per step)
     size_t Step = 0;
-    // data job:
+    // data job: this rank's own slice. Aggregate (co-write) mode: the slice
+    // sits at its pre-assigned offset in the shared data.<node> sub-file,
+    // which every rank on the node co-writes with disjoint offsets; each
+    // rank drains only its own slices.
     std::string StagingPath;
-    uint64_t FinalPos = 0; // offset of the step in the final data sub-file
-    size_t DataSize = 0; // per-rank: this rank's bytes; aggregate: node total
-    // Aggregate mode: the node leader drains every rank on its node in this
-    // single job; empty in the per-rank (EveryoneWrites) mode, in which case
-    // StagingPath/FinalPos/DataSize describe the one slice.
-    std::vector<BbstageDrainMember> Members;
+    uint64_t FinalPos = 0; // offset of the slice in the final data sub-file
+    size_t DataSize = 0;
     // commit job (rank 0):
     std::vector<char> MMDBytes; // meta-metadata records for mmd.0
     std::vector<char> MDRecord; // one md.0 step record
