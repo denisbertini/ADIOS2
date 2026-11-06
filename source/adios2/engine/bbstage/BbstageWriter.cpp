@@ -975,9 +975,10 @@ void BbstageWriter::WorkerLoop()
         }
 
         const auto tDrainStart = std::chrono::steady_clock::now();
+        bool completed = false;
         try
         {
-            RunDataJob(job);
+            completed = RunDataJob(job);
         }
         catch (...)
         {
@@ -990,6 +991,18 @@ void BbstageWriter::WorkerLoop()
             }
             m_DataCV.notify_all();
             m_CommitCV.notify_all();
+            return;
+        }
+        if (!completed)
+        {
+            // Close requested an abort mid-copy (m_DrainAbort): put the job
+            // back at the head of the queue (it is not accounted drained,
+            // not marked done, its staging file is intact) and stop. Staged
+            // Close's session snapshot below hands it to the finalizer,
+            // which re-drains it: same bytes at the same pre-assigned
+            // offsets, so the partial writes so far are simply rewritten.
+            std::lock_guard<std::mutex> lck(m_Mutex);
+            m_DataQueue.push_front(std::move(job));
             return;
         }
         // Drain throughput stats (BBSTAGE_TIMING): wall time of the copy job
@@ -1076,12 +1089,13 @@ void BbstageWriter::WorkerLoop()
     }
 }
 
-void BbstageWriter::RunDataJob(DrainJob &job)
+bool BbstageWriter::RunDataJob(DrainJob &job)
 {
     // Copy this rank's staging file into the data sub-file at its final
     // offset. Aggregate co-write: the offset is this rank's pre-assigned
     // range in the shared node sub-file; no two ranks write the same bytes.
-    auto drainOne = [this](const std::string &stagingPath, uint64_t finalPos, size_t dataSize) {
+    auto drainOne = [this](const std::string &stagingPath, uint64_t finalPos,
+                           size_t dataSize) -> bool {
         const int sfd = open(stagingPath.c_str(), O_RDONLY | O_CLOEXEC);
         if (sfd < 0)
         {
@@ -1112,6 +1126,15 @@ void BbstageWriter::RunDataJob(DrainJob &job)
         uint64_t outOff = finalPos;
         while (remain > 0)
         {
+            if (m_DrainAbort.load(std::memory_order_relaxed))
+            {
+                // Close was requested mid-copy: stop at this chunk boundary
+                // without deleting the staging file. Everything written so
+                // far is final (same bytes, same pre-assigned offsets); the
+                // re-drain from the finalizer repeats it idempotently.
+                close(sfd);
+                return false;
+            }
             const size_t want = std::min(remain, buf.size());
             ssize_t n = 0;
             do
@@ -1139,15 +1162,20 @@ void BbstageWriter::RunDataJob(DrainJob &job)
             std::error_code ec;
             std::filesystem::remove(stagingPath, ec); // best effort
         }
+        return true;
     };
 
-    drainOne(job.StagingPath, job.FinalPos, job.DataSize);
+    if (!drainOne(job.StagingPath, job.FinalPos, job.DataSize))
+    {
+        return false;
+    }
 
     if (m_Parameters.verbose > 2)
     {
         std::cout << "bbstage rank " << m_RankMPI << " drained step " << job.Step << " ("
                   << job.DataSize << " bytes)\n";
     }
+    return true;
 }
 
 void BbstageWriter::CommitterLoop()
@@ -1958,10 +1986,15 @@ void BbstageWriter::DoClose(const int /*transportIndex*/)
         // (no bbstage.final marker).
         BbstageStagedFinalizer::Instance().CheckError();
 
-        // The concurrent drain workers stop before the hand-off: the join
-        // lets an in-flight job finish (drain, progress publish, state
-        // update) so the session snapshot below is consistent and no two
-        // drain actors ever touch the same job or fd.
+        // The concurrent drain workers stop before the hand-off. An
+        // in-flight copy is aborted at its next chunk boundary and returns
+        // to the queue (see WorkerLoop), so the join -- and therefore Close
+        // -- is bounded by one chunk, not by the duration of a
+        // store-capped drain copy. The session snapshot below is still
+        // taken with every worker joined, so no two drain actors ever touch
+        // the same job or fd, and the finalizer re-drains the returned job
+        // idempotently (same bytes, same pre-assigned offsets).
+        m_DrainAbort.store(true, std::memory_order_relaxed);
         StopDrainThreads();
         PrintDrainStats("during-run");
         // Surface a mid-run drain failure now, while the error is still
@@ -2124,7 +2157,10 @@ void BbstageWriter::DestructorClose(bool /*Verbose*/) noexcept
     // Abandoned open engine: staged-but-undrained data is lost, which is the
     // documented burst-buffer contract (Close() is the durability point).
     // Still, the background threads and fds must be released so that member
-    // destruction cannot terminate the process.
+    // destruction cannot terminate the process -- and release must not wait
+    // on a store-capped in-flight copy: ask for a chunk-boundary abort, the
+    // dropped jobs are exactly the data this contract already loses.
+    m_DrainAbort.store(true, std::memory_order_relaxed);
     StopDrainThreads();
     if (m_DataFd >= 0)
     {

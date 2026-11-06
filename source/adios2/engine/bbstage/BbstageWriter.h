@@ -212,7 +212,10 @@ private:
     void StopDrainThreads() noexcept;
     void WorkerLoop();
     void CommitterLoop();
-    void RunDataJob(DrainJob &job);
+    // false return: Close requested an abort mid-copy; the job (unmodified,
+    // not accounted, staging file intact) must be returned to the queue for
+    // the finalizer to re-drain idempotently.
+    bool RunDataJob(DrainJob &job);
     void RunCommitJob(const DrainJob &job);
     void WaitForAllRanksDrained(size_t step);
     void PrintDrainStats(const char *where); // BBSTAGE_TIMING drain rate line
@@ -316,6 +319,13 @@ private:
     std::atomic<uint64_t> m_DrainStatBytes{0};
     std::atomic<uint64_t> m_DrainStatNanos{0};
     std::atomic<uint64_t> m_DrainStatJobs{0};
+    // Staged Close (and the abandoned-engine destructor) set this so a
+    // mid-copy drain job stops at its next chunk boundary instead of making
+    // Close wait for the whole copy: Close cost becomes independent of the
+    // (possibly store-capped) drain rate. The unfinished job returns to the
+    // queue for the finalizer to re-drain (idempotent; see WorkerLoop).
+    // Durable Close never sets it: there the drain IS the durability point.
+    std::atomic<bool> m_DrainAbort{false};
     std::set<size_t> m_DoneDataSeqs;
     size_t m_CommitEnqueued = 0;
     size_t m_CommitDone = 0;
