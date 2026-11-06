@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <sstream>
@@ -33,6 +34,15 @@ namespace engine
 namespace
 {
 constexpr size_t DrainCopyBufferSize = 4 * 1024 * 1024; // cf. bbviewd's replay buffer
+
+// Same opt-in as the engine's per-phase timing (see BbstageWriter.cpp):
+// BBSTAGE_TIMING=1 enables the drain throughput stat line per session.
+bool StagedTimingEnabled()
+{
+    const char *v = std::getenv("BBSTAGE_TIMING");
+    return v != nullptr &&
+           (std::strcmp(v, "1") == 0 || std::strcmp(v, "true") == 0 || std::strcmp(v, "on") == 0);
+}
 
 [[noreturn]] void ThrowPosix(const std::string &what)
 {
@@ -260,6 +270,21 @@ void BbstageStagedFinalizer::CompleteSessionData(Session &s)
     {
         std::cout << "bbstage finalizer rank " << s.Rank << ": all data of "
                   << s.FinalDir << " drained\n";
+    }
+    if (StagedTimingEnabled() && s.DrainJobs > 0)
+    {
+        // Staged-mode drain tail: the rate achieved by this rank's drain
+        // workers after the Close hand-off. Compare with the engine's
+        // "drain-stats during-run" line for the same checkpoint file.
+        std::cerr << "bbstage finalizer rank " << s.Rank << " drain-stats tail " << s.FinalDir
+                  << ": " << s.DrainJobs << " jobs, "
+                  << (static_cast<double>(s.DrainBytes) / (1024.0 * 1024.0 * 1024.0)) << " GiB in "
+                  << s.DrainSecs << " s = "
+                  << (s.DrainSecs > 0.0
+                          ? static_cast<double>(s.DrainBytes) / (1024.0 * 1024.0) / s.DrainSecs
+                          : 0.0)
+                  << " MiB/s\n";
+        std::cerr.flush();
     }
 }
 
@@ -636,6 +661,7 @@ void BbstageStagedFinalizer::DrainWorkerLoop()
             continue;
         }
 
+        const auto tDrainStart = std::chrono::steady_clock::now();
         try
         {
             RunDataJob(*s, job);
@@ -667,6 +693,12 @@ void BbstageStagedFinalizer::DrainWorkerLoop()
                     ++s->DrainedWatermark;
                 }
                 s->ProgressBytes += job.DataSize;
+                // drain throughput stats (BBSTAGE_TIMING), under m_Mutex
+                ++s->DrainJobs;
+                s->DrainBytes += job.DataSize;
+                s->DrainSecs += std::chrono::duration<double>(
+                                    std::chrono::steady_clock::now() - tDrainStart)
+                                    .count();
                 if (s->DrainedWatermark > s->PublishedSteps)
                 {
                     // Aggregate co-write: this rank's record is node-local

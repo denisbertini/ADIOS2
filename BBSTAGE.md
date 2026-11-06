@@ -55,7 +55,8 @@ parameters (e.g. the WarpX checkpoint path via openPMD-api), these
 environment variables act as fallbacks (precedence: parameter > env var >
 default): `BBSTAGE_CLOSE_MODE`, `BBSTAGE_STAGING_WATERMARK_MB`,
 `BBSTAGE_AGGREGATE` (`on`/`off`),
-`BBSTAGE_TIMING` (=1: per-phase Open/Close timing lines on stderr).
+`BBSTAGE_TIMING` (=1: per-phase Open/Close timing and per-rank drain
+throughput lines on stderr).
 
 Full parameter list, protocol semantics, and limitations:
 [`docs/user_guide/source/engines/bbstage.rst`](docs/user_guide/source/engines/bbstage.rst).

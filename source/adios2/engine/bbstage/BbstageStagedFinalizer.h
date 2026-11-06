@@ -91,6 +91,12 @@ public:
         int DataFd = -1;
         int ProgressFd = -1;
         uint64_t ProgressSeq = 0;
+        // drain throughput stats (BBSTAGE_TIMING): cumulative over this
+        // session's drain workers, guarded by the finalizer mutex; printed
+        // when the session's data completes (staged-mode drain tail).
+        uint64_t DrainJobs = 0;
+        uint64_t DrainBytes = 0;
+        double DrainSecs = 0.0;
         std::shared_ptr<Transport> MDFile;
         std::shared_ptr<Transport> MMDFile;
         std::shared_ptr<Transport> MDIndexFile;

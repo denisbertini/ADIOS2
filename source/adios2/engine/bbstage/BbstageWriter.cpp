@@ -734,6 +734,25 @@ void BbstageWriter::EndStep()
         if (m_IsLeader)
         {
             m_DataPos = nodeFilePos + prefix; // prefix == this step's node total
+            // Pre-extend the shared node sub-file to cover this step's
+            // slices. Without this, every drain client on the node writes
+            // beyond the current EOF concurrently, and Lustre's per-inode
+            // size maintenance (MDT size lock ping-ponging between the
+            // NodeSize writers) serializes the co-write drain -- the classic
+            // multi-client append pathology, and the aggregate-mode drain
+            // stall this is fixing. One ftruncate per node per step replaces
+            // ~(node step bytes / 4 MiB) concurrent size updates on the
+            // shared inode; the drain pwrites then land below EOF on
+            // disjoint byte ranges, which parallelizes. Only the leader ever
+            // changes the size, and always upward: a sibling ftruncate could
+            // race against the leader's larger extension and shrink the
+            // file. Writers may still race ahead of this call for the first
+            // chunks of a step (benign: those writes behave as before); the
+            // bulk of the slice lands below the new EOF.
+            if (ftruncate(m_DataFd, static_cast<off_t>(nodeFilePos + prefix)) != 0)
+            {
+                ThrowPosix("pre-extend node sub-file " + m_DataFileName);
+            }
         }
         // Backpressure, per rank (co-write: every rank drains its own
         // bytes). Durable mode needs no guard.
@@ -955,6 +974,7 @@ void BbstageWriter::WorkerLoop()
             continue;
         }
 
+        const auto tDrainStart = std::chrono::steady_clock::now();
         try
         {
             RunDataJob(job);
@@ -972,6 +992,18 @@ void BbstageWriter::WorkerLoop()
             m_CommitCV.notify_all();
             return;
         }
+        // Drain throughput stats (BBSTAGE_TIMING): wall time of the copy job
+        // only. Aggregate mode reads this rank's staging slice and writes its
+        // own offsets of the shared node file, so the rate measured here is
+        // exactly the per-client share of the co-write drain.
+        m_DrainStatNanos.fetch_add(
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - tDrainStart)
+                    .count()),
+            std::memory_order_relaxed);
+        m_DrainStatBytes.fetch_add(job.DataSize, std::memory_order_relaxed);
+        m_DrainStatJobs.fetch_add(1, std::memory_order_relaxed);
 
         {
             std::lock_guard<std::mutex> lck(m_Mutex);
@@ -1386,6 +1418,32 @@ void BbstageWriter::PublishNodeProgress()
         }
         std::filesystem::remove(m_StagingDir, ec); // best effort: succeeds only if empty
     }
+}
+
+void BbstageWriter::PrintDrainStats(const char *where)
+{
+    // Drain throughput of this engine's drain workers (BBSTAGE_TIMING only).
+    // The staged-mode tail after Close is measured separately by the
+    // finalizer; comparing the two lines separates "slow during the run"
+    // from "slow at the drain tail".
+    if (!BbstageTimingEnabled())
+    {
+        return;
+    }
+    const uint64_t jobs = m_DrainStatJobs.exchange(0, std::memory_order_relaxed);
+    const uint64_t bytes = m_DrainStatBytes.exchange(0, std::memory_order_relaxed);
+    const uint64_t nanos = m_DrainStatNanos.exchange(0, std::memory_order_relaxed);
+    if (jobs == 0)
+    {
+        return;
+    }
+    const double secs = static_cast<double>(nanos) * 1e-9;
+    std::cerr << "bbstage rank " << m_RankMPI << " drain-stats " << where << ": " << jobs
+              << " jobs, " << (static_cast<double>(bytes) / (1024.0 * 1024.0 * 1024.0))
+              << " GiB in " << secs << " s = "
+              << (secs > 0.0 ? static_cast<double>(bytes) / (1024.0 * 1024.0) / secs : 0.0)
+              << " MiB/s\n";
+    std::cerr.flush();
 }
 
 void BbstageWriter::CheckDrainError()
@@ -1905,6 +1963,7 @@ void BbstageWriter::DoClose(const int /*transportIndex*/)
         // update) so the session snapshot below is consistent and no two
         // drain actors ever touch the same job or fd.
         StopDrainThreads();
+        PrintDrainStats("during-run");
         // Surface a mid-run drain failure now, while the error is still
         // attributable to this engine's session.
         CheckDrainError();

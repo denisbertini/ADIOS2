@@ -15,6 +15,7 @@
 #include "adios2/toolkit/format/bp5/BP5Serializer.h"
 #include "adios2/toolkit/transport/Transport.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -214,6 +215,7 @@ private:
     void RunDataJob(DrainJob &job);
     void RunCommitJob(const DrainJob &job);
     void WaitForAllRanksDrained(size_t step);
+    void PrintDrainStats(const char *where); // BBSTAGE_TIMING drain rate line
     void WriteProgress(uint64_t drainedSteps, uint64_t drainedBytes);
     // aggregate co-write, called under m_Mutex:
     void WriteLocalProgress(uint64_t drainedSteps, uint64_t drainedBytes); // every rank
@@ -309,6 +311,11 @@ private:
                                    // (local) progress record
     uint64_t m_PublishedNodeSteps = 0; // aggregate leader: steps already
                                        // published in the node record
+    // Drain throughput stats for BBSTAGE_TIMING: cumulative over this
+    // engine's drain workers (cross-thread: atomics), printed at Close.
+    std::atomic<uint64_t> m_DrainStatBytes{0};
+    std::atomic<uint64_t> m_DrainStatNanos{0};
+    std::atomic<uint64_t> m_DrainStatJobs{0};
     std::set<size_t> m_DoneDataSeqs;
     size_t m_CommitEnqueued = 0;
     size_t m_CommitDone = 0;
