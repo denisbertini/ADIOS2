@@ -64,8 +64,7 @@ Full parameter list, protocol semantics, and limitations:
 ## Notes
 
 - Write-only engine; the read side is the stock `bp5` engine. POSIX staging only.
-- **Aggregate co-write drain** (`Aggregate=on`, branch
-  `bbstage-aggregate-drain`): motivated by metadata/file-count explosion at
+- **Aggregate co-write drain** (`Aggregate=on`): motivated by metadata/file-count explosion at
   large rank counts. With the stock per-rank layout, a job with R ranks
   writing S separate BP5 files (e.g. WarpX's one-file-per-step) creates R x S
   data sub-files on the final store; the parallel store's metadata servers and
@@ -87,6 +86,41 @@ Full parameter list, protocol semantics, and limitations:
   of the non-aggregated layout at the file count of aggregate. The
   multi-client single-file pattern is the same one BP5's own aggregator
   chains use.
+- **Field validation (RZ Lustre, 8 nodes x 32 ranks, 64 GiB/checkpoint,
+  10 checkpoints, both engines in one job minutes apart):** with the store
+  contended (native BP5 managed only 2.5 GiB/s), staged + aggregate ran
+  7.7 s vs 26.5 s mean per checkpoint (**3.4x**) and 100 s vs 283 s total
+  job wall (**2.8x**); per-rank `drain-stats` showed the background drain
+  streaming ~1.2 GiB/s per node while the app stayed at its compute floor.
+  On fast-store days both engines tie at the application floor (nothing to
+  hide); the staged win is exactly proportional to store contention, which
+  is the intended regime. Output verified stock-`bpls` readable with
+  exactly `data.0..data.7` per checkpoint.
+- **Two Lustre-specific mechanisms the co-write drain needed** (both
+  measured and fixed; they are why an earlier aggregate design drained at
+  the single-client rate):
+  1. *Shared-inode size lock*: with 32 clients writing a fresh `data.<node>`
+     each checkpoint, every drain write lands beyond the current EOF, and
+     Lustre maintains inode size on the MDT — concurrent EOF-extending
+     writes serialize on the size lock (the classic multi-client append
+     pathology; it also explains why `lfs setstripe` did not help). The
+     node leader now `ftruncate`s the sub-file to the step end at
+     `EndStep` (one MDT op per node per step); drain writes then land
+     below EOF on disjoint ranges and parallelize.
+  2. *Close waiting on an in-flight copy*: staged `Close()` joined the
+     drain workers, so on a store-capped drain every checkpoint paid one
+     full drain copy at Close (measured: 13.9 s on all 256 ranks). Close
+     now aborts the in-flight copy at its next 4 MiB chunk boundary and
+     hands it to the finalizer, which re-drains it idempotently (same
+     bytes, same pre-assigned offsets). Close cost is bounded by one
+     chunk (measured: 1 ms).
+- **Tuning notes:** use the default watermark (1 GiB) for production — it
+  self-throttles the app when the store cannot keep up and keeps /tmp
+  usage and the exit tail small; a huge watermark (e.g. 64 GiB) instead
+  banks the backlog in /tmp (must hold watermark x ranks/node of slack)
+  and shifts repayment to process exit. `BBSTAGE_TIMING=1` prints
+  per-phase Close timings and per-rank `drain-stats` MiB/s lines — the
+  direct measure of drain throughput, independent of app phases.
 - Design lineage: the staging + background-drain approach follows
   [BBView](https://github.com/tsukuba-hpcs/bbview) (Koyama & Tatebe,
   REX-IO 2025), implemented fully in-process. There is no view

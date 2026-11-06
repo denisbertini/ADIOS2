@@ -34,7 +34,14 @@ It transports self-describing variables and attributes across files, networks, a
 This fork adds **bbstage**, a write-only BP5 engine with node-local
 burst-buffer staging and asynchronous drain to the final store
 (`CloseMode=staged` returns `Close()` at the local dump; output remains
-standard BP5). See [BBSTAGE.md](BBSTAGE.md).
+standard BP5). `Aggregate=on` additionally drains into one data sub-file
+per node, co-written by the node's ranks, so data-file count scales with
+node count instead of rank count while keeping one store client per rank.
+Measured on RZ Lustre (256 ranks, 64 GiB/checkpoint): **3.4x faster
+checkpoints** (7.7 s vs 26.5 s mean) and **2.8x lower total job wall**
+(100 s vs 283 s) than native BP5 on a day when the shared store was the
+bottleneck; the staged path also reads back with the stock BP5 reader.
+See [BBSTAGE.md](BBSTAGE.md).
 
 ## Example
 
