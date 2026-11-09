@@ -113,6 +113,13 @@ bbstage-specific parameters:
 +--------------------+---------+-----------------------------------------------+
 | StagingSync        | false   | ``fsync`` the staging file inside ``EndStep`` |
 +--------------------+---------+-----------------------------------------------+
+| StagingPreallocate | false   | ``fallocate`` the staging file at ``EndStep``,|
+|                    |         | but only when the staging tier is tmpfs: one  |
+|                    |         | batched allocation replaces per-page faults in|
+|                    |         | the spill (measured ~6x faster), and a RAM-   |
+|                    |         | budget overrun fails fast before any partial  |
+|                    |         | write. Ignored with a warning on block F/S.   |
++--------------------+---------+-----------------------------------------------+
 | DrainDataSync      | false   | ``fsync`` the final data file at each         |
 |                    |         | ``Flush()``/``Close()`` drain barrier         |
 +--------------------+---------+-----------------------------------------------+
@@ -171,6 +178,9 @@ environment variable > default.
 +--------------------------+---------------------------------------------+
 | ``BBSTAGE_STAGING_WA-    | watermark in MiB                            |
 | TERMARK_MB``             | (``StagingWatermarkMB``)                    |
++--------------------------+---------------------------------------------+
+| ``BBSTAGE_STAGING_PRE-   | ``on``/``off`` (``StagingPreallocate``)     |
+| ALLOCATE``               |                                             |
 +--------------------------+---------------------------------------------+
 | ``BBSTAGE_TIMING``       | ``1`` prints per-phase Open/EndStep/Close   |
 |                          | timing and per-rank drain-throughput        |

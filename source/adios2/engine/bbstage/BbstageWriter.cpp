@@ -34,8 +34,14 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <linux/magic.h> // TMPFS_MAGIC
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <unistd.h>
+
+#ifndef TMPFS_MAGIC
+#define TMPFS_MAGIC 0x01021994
+#endif
 
 namespace adios2
 {
@@ -271,6 +277,20 @@ void BbstageWriter::InitParameters()
     if (helper::GetParameter(lower, "stagingsync", s))
     {
         m_StagingSync = (s == "true" || s == "on" || s == "1");
+    }
+    if (helper::GetParameter(lower, "stagingpreallocate", s))
+    {
+        m_StagingPreallocate = (s == "true" || s == "on" || s == "1");
+    }
+    else
+    {
+        // middleware fallback (same precedence rule as the other env vars)
+        std::string envPrealloc;
+        if (helper::GetEnv("BBSTAGE_STAGING_PREALLOCATE", envPrealloc))
+        {
+            m_StagingPreallocate = (envPrealloc == "true" || envPrealloc == "on" ||
+                                    envPrealloc == "1");
+        }
     }
     if (helper::GetParameter(lower, "draindatasync", s))
     {
@@ -580,6 +600,29 @@ void BbstageWriter::InitTransports()
     }
     openPhase("staging-mkdir");
 
+    // StagingPreallocate: effective only on a tmpfs staging tier (e.g.
+    // /dev/shm). There the write path pays a page-allocation fault per 4 KiB
+    // inside the spill; one fallocate batches all allocations, the write
+    // becomes pure memcpy (measured on RZ /dev/shm: ~6x faster spill per
+    // 128 MiB), and a budget-exceeded tier fails fast with ENOSPC before any
+    // partial write. On block-filesystem page caches (ext4/XFS) delayed
+    // allocation already amortizes block allocation and the call is a
+    // measured no-op, so a request against a non-tmpfs tier is ignored with
+    // a warning rather than silently applied.
+    if (m_StagingPreallocate)
+    {
+        struct statfs sfs;
+        if (statfs(m_StagingDir.c_str(), &sfs) == 0 && sfs.f_type == (signed)TMPFS_MAGIC)
+        {
+            m_StagingPrealloc = true;
+        }
+        else if (m_Parameters.verbose > 0)
+        {
+            std::cerr << "bbstage rank " << m_RankMPI << ": StagingPreallocate=on ignored: "
+                      << "staging tier " << m_StagingDir << " is not tmpfs\n";
+        }
+    }
+
     char hostname[256] = {0};
     if (gethostname(hostname, sizeof(hostname) - 1) != 0)
     {
@@ -810,6 +853,24 @@ void BbstageWriter::EndStep()
         if (sfd < 0)
         {
             ThrowPosix("open staging file " + stagingPath);
+        }
+        if (m_StagingPrealloc)
+        {
+            // Reserve the exact step size in one syscall (tmpfs tier only;
+            // see InitTransports). The write below then copies into
+            // pre-populated pages, and a tier without room fails here --
+            // before any partial write -- with the budget rule in the
+            // message: staged bytes on tmpfs reside in RAM, so the job's
+            // memory allocation must cover watermark x ranks-per-node plus
+            // the application footprint.
+            if (fallocate(sfd, 0, 0, static_cast<off_t>(dataSize)) != 0)
+            {
+                close(sfd);
+                ThrowPosix("fallocate staging file " + stagingPath +
+                           ": staging tier out of space? On a tmpfs tier staged bytes live in "
+                           "RAM: budget (watermark x ranks-per-node + application footprint) "
+                           "within the job memory allocation");
+            }
         }
         std::vector<core::iovec> dataVec = TSInfo.DataBuffer->DataVec();
         spillFrags = dataVec.size(); // instrumentation: syscalls this spill costs

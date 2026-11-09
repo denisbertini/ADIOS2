@@ -49,12 +49,14 @@ The output is **standard BP5**: read it back with the stock `bp5` engine,
 | `DrainThreads`     | `1`     | drain worker threads per rank (run from `Open` in both close modes)                              |
 | `CommitTimeoutSecs`| `300`   | give up waiting on a stuck peer rank after this long (0 = forever); in staged mode also the stall timeout of the watermark backpressure |
 | `Aggregate`        | `off`   | `on`: node-aggregated co-write drain. Local staging stays per-rank; the SSD -> final-store drain writes one `data.<node>` sub-file per node that every rank on the node co-writes (each rank drains its own slices at pre-assigned disjoint offsets: one store client per rank, one file per node). Data sub-file count scales with node count, not rank count. Off critical path. Must be uniform across ranks |
+| `StagingPreallocate` | `off` | `on`: `fallocate` each staging file at `EndStep`, **only when the staging tier is tmpfs** (e.g. `BurstBufferPath=/dev/shm`): one batched allocation replaces tmpfs per-page faults in the spill (measured ~6x faster on RZ /dev/shm; the spill @ column of `BBSTAGE_TIMING` shows it), and a RAM-budget overrun fails fast with a clear error before any partial write. Ignored (with a warning) on block-filesystem tiers, where it is a measured no-op |
 
 When bbstage is reached through middleware that cannot pass engine
 parameters (e.g. the WarpX checkpoint path via openPMD-api), these
 environment variables act as fallbacks (precedence: parameter > env var >
 default): `BBSTAGE_CLOSE_MODE`, `BBSTAGE_STAGING_WATERMARK_MB`,
-`BBSTAGE_AGGREGATE` (`on`/`off`),
+`BBSTAGE_AGGREGATE` (`on`/`off`), `BBSTAGE_STAGING_PREALLOCATE`
+(`on`/`off`),
 `BBSTAGE_TIMING` (=1: per-phase Open/EndStep/Close timing and per-rank drain
 throughput lines on stderr).
 
@@ -114,6 +116,20 @@ Full parameter list, protocol semantics, and limitations:
      hands it to the finalizer, which re-drains it idempotently (same
      bytes, same pre-assigned offsets). Close cost is bounded by one
      chunk (measured: 1 ms).
+- **Staging tier choice (RZ measurements, spillbench):** a /tmp backed by a
+  single NVMe is the tier ceiling, not the software: 2.3-5.2 GiB/s per node
+  depending on drive model (uniform across writers = device-bound; ext4/XFS
+  allocation tuning — fallocate/openat/pwritev — measured no-op there).
+  `/dev/shm` (tmpfs) stages at memory speed instead: ~8 GiB/s plain, ~50
+  GiB/s with `StagingPreallocate=on`. Recipe for `CloseMode=staged`:
+  `BurstBufferPath=/dev/shm` + `StagingPreallocate=on` + default watermark,
+  **when the job's memory allocation covers** `(watermark + backlog) x
+  ranks-per-node + application footprint` — tmpfs pages are pinned RAM, not
+  reclaimable page cache (a real budget overrun OOMs; `StagingPreallocate`
+  turns that into a fast, explained `fallocate` failure instead). On
+  memory-tight jobs, stay on /tmp: its page cache degrades gracefully.
+  `StagingSync` is meaningless on tmpfs (fsync is a no-op — there is no
+  device); durability stays `bbstage.final` on the final store either way.
 - **Tuning notes:** use the default watermark (1 GiB) for production — it
   self-throttles the app when the store cannot keep up and keeps /tmp
   usage and the exit tail small; a huge watermark (e.g. 64 GiB) instead

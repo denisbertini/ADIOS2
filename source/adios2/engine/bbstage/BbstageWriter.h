@@ -241,6 +241,11 @@ private:
     // bbstage-specific parameters
     unsigned int m_DrainThreads = 1;
     bool m_StagingSync = false;
+    // StagingPreallocate: user request (parameter/env), and the effective
+    // state after tmpfs detection at Open (prealloc is applied only when the
+    // staging tier is tmpfs, where it is a measured win; see InitTransports).
+    bool m_StagingPreallocate = false;
+    bool m_StagingPrealloc = false;
     bool m_DrainDataSync = false;
     unsigned int m_CommitPollMs = 2;
     float m_CommitTimeoutSecs = 300.f;
