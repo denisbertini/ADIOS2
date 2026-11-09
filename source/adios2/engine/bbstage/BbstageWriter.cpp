@@ -744,19 +744,27 @@ void BbstageWriter::EndStep()
 
     // BBSTAGE_TIMING: EndStep phase stamps (elapsed ms since EndStep start),
     // printed as one endstep-phase line at the end -- the same cumulative
-    // convention as the close-phase line. The watermark phase is the only
-    // unbounded one (store-lag backpressure), so this is the breakdown that
-    // answers "what did the application pay for inside EndStep": copy 1
-    // (marshal), node collectives + leader ftruncate (offsets), watermark
-    // wait, the spill copy, and the commit enqueue.
+    // convention as the close-phase line. This is the breakdown that answers
+    // "what did the application pay for inside EndStep": copy 1 (marshal),
+    // node collectives + leader ftruncate (offsets), watermark wait (the
+    // designed backpressure point), the spill (split into alloc =
+    // open + preallocate charge, and copy = the pwrite), and the commit
+    // enqueue. Any phase can be unbounded in practice (watermark on store
+    // lag, spill-alloc on memcg pressure at a tmpfs fence, spill-copy on
+    // page-cache writeback throttling), which is why each is timed.
     const bool timing = BbstageTimingEnabled();
     const auto tStepStart = std::chrono::steady_clock::now();
     const auto elapsedMs = [tStepStart](const std::chrono::steady_clock::time_point &t) {
         return std::chrono::duration_cast<std::chrono::milliseconds>(t - tStepStart).count();
     };
+    const auto durMs = [](const std::chrono::steady_clock::time_point &a,
+                          const std::chrono::steady_clock::time_point &b) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count();
+    };
     const auto tSerialize = std::chrono::steady_clock::now();
     auto tOffsets = tSerialize;
     auto tWatermark = tSerialize;
+    auto tAlloc = tSerialize;
     auto tSpill = tSerialize;
     auto tCommit = tSerialize;
     size_t spillFrags = 0;
@@ -872,6 +880,7 @@ void BbstageWriter::EndStep()
                            "within the job memory allocation");
             }
         }
+        tAlloc = std::chrono::steady_clock::now(); // alloc = open + preallocate
         std::vector<core::iovec> dataVec = TSInfo.DataBuffer->DataVec();
         spillFrags = dataVec.size(); // instrumentation: syscalls this spill costs
         PwriteAll(sfd, dataVec, 0);
@@ -918,11 +927,26 @@ void BbstageWriter::EndStep()
 
     if (timing)
     {
-        std::cerr << "bbstage rank " << m_RankMPI << " endstep-phase step " << m_WriterStep
-                  << ": marshal @" << elapsedMs(tSerialize) << " ms | offsets @"
-                  << elapsedMs(tOffsets) << " ms | watermark @" << elapsedMs(tWatermark)
-                  << " ms | spill @" << elapsedMs(tSpill) << " ms ("
-                  << (static_cast<double>(dataSize) / (1024.0 * 1024.0)) << " MiB, " << spillFrags
+        // Self-identifying line: the stream basename names the checkpoint (one
+        // .bp per step) and thus which run it came from in shared logs; the
+        // spill column carries the achieved rate plus an alloc/copy split so a
+        // multi-second stall is labeled by mechanism (alloc = charge-site:
+        // memcg reclaim at a tmpfs fence; copy = tier-side: page-cache dirty
+        // throttling on an XFS tier, bandwidth contention otherwise).
+        const std::string streamName = m_Name.substr(m_Name.find_last_of('/') + 1);
+        const double dataMiB = static_cast<double>(dataSize) / (1024.0 * 1024.0);
+        const long long allocMs = durMs(tWatermark, tAlloc);
+        const long long copyMs = durMs(tAlloc, tSpill);
+        const long long rateMiBs = (allocMs + copyMs > 0)
+                                       ? static_cast<long long>(dataMiB * 1000.0 /
+                                                                static_cast<double>(allocMs + copyMs))
+                                       : 0;
+        std::cerr << "bbstage rank " << m_RankMPI << " endstep-phase " << streamName << " step "
+                  << m_WriterStep << ": marshal @" << elapsedMs(tSerialize)
+                  << " ms | offsets @" << elapsedMs(tOffsets) << " ms | watermark @"
+                  << elapsedMs(tWatermark) << " ms | spill @" << elapsedMs(tSpill) << " ms = "
+                  << rateMiBs << " MiB/s (alloc " << allocMs << " ms, copy " << copyMs
+                  << " ms, " << dataMiB << " MiB, " << spillFrags
                   << " frags) | commit @" << elapsedMs(tCommit) << " ms\n";
         std::cerr.flush();
     }

@@ -135,9 +135,15 @@ Full parameter list, protocol semantics, and limitations:
   usage and the exit tail small; a huge watermark (e.g. 64 GiB) instead
   banks the backlog in /tmp (must hold watermark x ranks/node of slack)
   and shifts repayment to process exit. `BBSTAGE_TIMING=1` prints
-  per-phase Open/EndStep/Close timings (`endstep-phase` splits a step into
-  marshal / offsets / watermark / spill / commit-enqueue — the watermark
-  wait is the one phase bounded by store health) and per-rank `drain-stats`
+  per-phase Open/EndStep/Close timings (`endstep-phase` names the stream,
+  the step, and the achieved spill MiB/s, and splits a step into
+  marshal / offsets / watermark / spill (alloc + copy) / commit-enqueue.
+  Each phase pins a different mechanism: watermark = store-lag
+  backpressure; spill-alloc = staging-charge site (on a tmpfs tier,
+  multi-second alloc stalls there mean the job is grazing its memory
+  allocation fence — lower the watermark or raise the allocation);
+  spill-copy = tier-bandwidth site (page-cache writeback throttling on an
+  XFS tier).) and per-rank `drain-stats`
   MiB/s lines — the direct measure of drain throughput, independent of app
   phases.
 - Design lineage: the staging + background-drain approach follows
