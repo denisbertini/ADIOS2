@@ -699,6 +699,25 @@ void BbstageWriter::EndStep()
 
     const size_t dataSize = TSInfo.DataBuffer->Size();
 
+    // BBSTAGE_TIMING: EndStep phase stamps (elapsed ms since EndStep start),
+    // printed as one endstep-phase line at the end -- the same cumulative
+    // convention as the close-phase line. The watermark phase is the only
+    // unbounded one (store-lag backpressure), so this is the breakdown that
+    // answers "what did the application pay for inside EndStep": copy 1
+    // (marshal), node collectives + leader ftruncate (offsets), watermark
+    // wait, the spill copy, and the commit enqueue.
+    const bool timing = BbstageTimingEnabled();
+    const auto tStepStart = std::chrono::steady_clock::now();
+    const auto elapsedMs = [tStepStart](const std::chrono::steady_clock::time_point &t) {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(t - tStepStart).count();
+    };
+    const auto tSerialize = std::chrono::steady_clock::now();
+    auto tOffsets = tSerialize;
+    auto tWatermark = tSerialize;
+    auto tSpill = tSerialize;
+    auto tCommit = tSerialize;
+    size_t spillFrags = 0;
+
     uint64_t finalPos = 0;
     uint64_t nodeFilePos = 0;         // aggregate: this step's aligned node-file base
     std::vector<uint64_t> nodeSizes;  // aggregate: per-rank sizes, node-local rank order
@@ -754,12 +773,14 @@ void BbstageWriter::EndStep()
                 ThrowPosix("pre-extend node sub-file " + m_DataFileName);
             }
         }
+        tOffsets = std::chrono::steady_clock::now();
         // Backpressure, per rank (co-write: every rank drains its own
         // bytes). Durable mode needs no guard.
         if (m_CloseModeStaged)
         {
             BbstageStagedFinalizer::Instance().AccountStaged(dataSize);
         }
+        tWatermark = std::chrono::steady_clock::now();
     }
     else
     {
@@ -770,11 +791,13 @@ void BbstageWriter::EndStep()
         {
             finalPos += helper::PaddingToAlignOffset(finalPos, m_Parameters.StripeSize);
         }
+        tOffsets = std::chrono::steady_clock::now();
         // staged close: backpressure (per-rank). Durable mode needs no guard.
         if (m_CloseModeStaged)
         {
             BbstageStagedFinalizer::Instance().AccountStaged(dataSize);
         }
+        tWatermark = std::chrono::steady_clock::now();
     }
 
     // Synchronous spill of the step payload to node-local SSD: the bbstage
@@ -789,6 +812,7 @@ void BbstageWriter::EndStep()
             ThrowPosix("open staging file " + stagingPath);
         }
         std::vector<core::iovec> dataVec = TSInfo.DataBuffer->DataVec();
+        spillFrags = dataVec.size(); // instrumentation: syscalls this spill costs
         PwriteAll(sfd, dataVec, 0);
         if (m_StagingSync && fsync(sfd) != 0)
         {
@@ -798,6 +822,7 @@ void BbstageWriter::EndStep()
     }
     delete TSInfo.DataBuffer;
     TSInfo.DataBuffer = nullptr;
+    tSpill = std::chrono::steady_clock::now();
 
     // No barrier: co-write aggregate drains each rank's own staging file
     // (written above) into its own slice; non-aggregate is per-rank by
@@ -828,6 +853,18 @@ void BbstageWriter::EndStep()
     // The step number is passed explicitly: ++m_WriterStep happens right
     // after this call, and the commit gate compares against step + 1.
     AggregateAndEnqueueCommit(TSInfo, finalPos, dataSize, m_WriterStep);
+    tCommit = std::chrono::steady_clock::now();
+
+    if (timing)
+    {
+        std::cerr << "bbstage rank " << m_RankMPI << " endstep-phase step " << m_WriterStep
+                  << ": marshal @" << elapsedMs(tSerialize) << " ms | offsets @"
+                  << elapsedMs(tOffsets) << " ms | watermark @" << elapsedMs(tWatermark)
+                  << " ms | spill @" << elapsedMs(tSpill) << " ms ("
+                  << (static_cast<double>(dataSize) / (1024.0 * 1024.0)) << " MiB, " << spillFrags
+                  << " frags) | commit @" << elapsedMs(tCommit) << " ms\n";
+        std::cerr.flush();
+    }
 
     ++m_WriterStep;
 }

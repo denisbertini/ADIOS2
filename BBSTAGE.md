@@ -55,7 +55,7 @@ parameters (e.g. the WarpX checkpoint path via openPMD-api), these
 environment variables act as fallbacks (precedence: parameter > env var >
 default): `BBSTAGE_CLOSE_MODE`, `BBSTAGE_STAGING_WATERMARK_MB`,
 `BBSTAGE_AGGREGATE` (`on`/`off`),
-`BBSTAGE_TIMING` (=1: per-phase Open/Close timing and per-rank drain
+`BBSTAGE_TIMING` (=1: per-phase Open/EndStep/Close timing and per-rank drain
 throughput lines on stderr).
 
 Full parameter list, protocol semantics, and limitations:
@@ -119,8 +119,11 @@ Full parameter list, protocol semantics, and limitations:
   usage and the exit tail small; a huge watermark (e.g. 64 GiB) instead
   banks the backlog in /tmp (must hold watermark x ranks/node of slack)
   and shifts repayment to process exit. `BBSTAGE_TIMING=1` prints
-  per-phase Close timings and per-rank `drain-stats` MiB/s lines — the
-  direct measure of drain throughput, independent of app phases.
+  per-phase Open/EndStep/Close timings (`endstep-phase` splits a step into
+  marshal / offsets / watermark / spill / commit-enqueue — the watermark
+  wait is the one phase bounded by store health) and per-rank `drain-stats`
+  MiB/s lines — the direct measure of drain throughput, independent of app
+  phases.
 - Design lineage: the staging + background-drain approach follows
   [BBView](https://github.com/tsukuba-hpcs/bbview) (Koyama & Tatebe,
   REX-IO 2025), implemented fully in-process. There is no view

@@ -172,9 +172,9 @@ environment variable > default.
 | ``BBSTAGE_STAGING_WA-    | watermark in MiB                            |
 | TERMARK_MB``             | (``StagingWatermarkMB``)                    |
 +--------------------------+---------------------------------------------+
-| ``BBSTAGE_TIMING``       | ``1`` prints per-phase Open/Close timing    |
-|                          | and per-rank drain-throughput lines to      |
-|                          | stderr (default: off)                       |
+| ``BBSTAGE_TIMING``       | ``1`` prints per-phase Open/EndStep/Close   |
+|                          | timing and per-rank drain-throughput        |
+|                          | lines to stderr (default: off)              |
 +--------------------------+---------------------------------------------+
 | ``BBSTAGE_AGGREGATE``    | ``on``/``off`` (``Aggregate``)              |
 +--------------------------+---------------------------------------------+
