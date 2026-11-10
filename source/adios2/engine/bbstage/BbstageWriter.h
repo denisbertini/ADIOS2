@@ -95,6 +95,22 @@ namespace engine
  * GrowthFactor, StripeSize, StatsLevel, UseOneTimeAttributes, verbose):
  *
  *   DrainThreads        number of drain worker threads per rank (default 1)
+ *   DrainStreams        concurrent store streams per rank (default 1). The
+ *                       drain worker copies each staged slice with this many
+ *                       concurrent, disjoint range-copies: same bytes, same
+ *                       final offsets (the split is a pure partition of the
+ *                       slice), so the output is byte-identical to
+ *                       DrainStreams=1. Stores whose supply scales with the
+ *                       number of concurrent streams (wide OST-based Lustre
+ *                       farms: measured ~4x aggregate throughput at 4x the
+ *                       streams) drain correspondingly faster; stores that
+ *                       saturate at low stream counts are unaffected except
+ *                       for k-1 mostly-sleeping threads. The job is
+ *                       accounted drained only after all k sub-copies
+ *                       complete, so watermark, progress and commit
+ *                       semantics are unchanged. Applies to the engine
+ *                       drain workers; the post-Close finalizer keeps one
+ *                       stream per session.
  *   StagingSync         fsync staging file in EndStep (default false,
  *                       page-cache semantics, like the original bbview)
  *   DrainDataSync       fsync final data file after every drain barrier
@@ -166,6 +182,8 @@ namespace engine
  *
  *   BBSTAGE_CLOSE_MODE            "durable" or "staged" (CloseMode)
  *   BBSTAGE_STAGING_WATERMARK_MB  watermark in MiB (StagingWatermarkMB)
+ *   BBSTAGE_DRAIN_STREAMS         concurrent drain streams per rank
+ *                                 (DrainStreams)
  *   BBSTAGE_AGGREGATE             "on"/"off" (Aggregate)
  *   BBSTAGE_TIMING                "1" enables per-phase Open/Close timing
  *                                 lines on stderr (default: off)
@@ -240,6 +258,8 @@ private:
 
     // bbstage-specific parameters
     unsigned int m_DrainThreads = 1;
+    unsigned int m_DrainStreams = 1; // DrainStreams: concurrent range-copies
+                                     // per data job in the drain worker
     bool m_StagingSync = false;
     // StagingPreallocate: user request (parameter/env), and the effective
     // state after tmpfs detection at Open (prealloc is applied only when the

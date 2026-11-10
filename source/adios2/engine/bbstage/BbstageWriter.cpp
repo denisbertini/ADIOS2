@@ -273,6 +273,37 @@ void BbstageWriter::InitParameters()
         }
         m_DrainThreads = static_cast<unsigned int>(u);
     }
+    // DrainStreams: concurrent store streams per rank (see class docs).
+    // Same range as DrainThreads; out-of-range or unparsable values fail
+    // fast at Open: a silently ignored setting would corrupt A/B studies
+    // of the drain rate.
+    if (helper::GetParameter(lower, "drainstreams", u))
+    {
+        if (u < 1 || u > 16)
+        {
+            helper::Throw<std::invalid_argument>("Engine", "BbstageWriter", "InitParameters",
+                                                 "DrainStreams must be in [1,16], got " +
+                                                     std::to_string(u));
+        }
+        m_DrainStreams = static_cast<unsigned int>(u);
+    }
+    else
+    {
+        std::string envStreams;
+        if (helper::GetEnv("BBSTAGE_DRAIN_STREAMS", envStreams) && !envStreams.empty())
+        {
+            char *end = nullptr;
+            const unsigned long long v = std::strtoull(envStreams.c_str(), &end, 10);
+            if (end == envStreams.c_str() || *end != '\0' || v < 1 || v > 16)
+            {
+                helper::Throw<std::invalid_argument>("Engine", "BbstageWriter", "InitParameters",
+                                                     "BBSTAGE_DRAIN_STREAMS must be an integer "
+                                                     "in [1,16], got '" +
+                                                         envStreams + "'");
+            }
+            m_DrainStreams = static_cast<unsigned int>(v);
+        }
+    }
     std::string s;
     if (helper::GetParameter(lower, "stagingsync", s))
     {
@@ -680,10 +711,20 @@ void BbstageWriter::InitTransports()
     }
     openPhase("threads-started");
 
+    // Effective drain-stream count on the timing channel too, so every
+    // BBSTAGE_TIMING log self-documents the k it drained with (A/B audit).
+    if (doTiming)
+    {
+        std::cerr << "bbstage rank " << m_RankMPI << " drain streams = " << m_DrainStreams
+                  << "\n";
+        std::cerr.flush();
+    }
+
     if (m_Parameters.verbose > 0)
     {
         std::cout << "bbstage rank " << m_RankMPI << " opened stream " << m_Name
                   << " staging=" << m_StagingDir << " drainThreads=" << m_DrainThreads
+                  << " drainStreams=" << m_DrainStreams
                   << " closeMode=" << (m_CloseModeStaged ? "staged" : "durable") << "\n";
     }
 }
@@ -1216,80 +1257,199 @@ bool BbstageWriter::RunDataJob(DrainJob &job)
     // Copy this rank's staging file into the data sub-file at its final
     // offset. Aggregate co-write: the offset is this rank's pre-assigned
     // range in the shared node sub-file; no two ranks write the same bytes.
-    auto drainOne = [this](const std::string &stagingPath, uint64_t finalPos,
-                           size_t dataSize) -> bool {
-        const int sfd = open(stagingPath.c_str(), O_RDONLY | O_CLOEXEC);
-        if (sfd < 0)
-        {
-            ThrowPosix("open staging file for drain " + stagingPath);
-        }
-        // Verify the staging file size before draining: a file left short by
-        // a crash (or overwritten by external cleanup) would otherwise
-        // surface as a confusing short read mid-copy; fail fast with both
-        // sizes instead.
-        struct stat st;
-        if (fstat(sfd, &st) != 0)
-        {
-            close(sfd);
-            ThrowPosix("fstat staging file for drain " + stagingPath);
-        }
-        if (static_cast<size_t>(st.st_size) != dataSize)
-        {
-            close(sfd);
-            helper::Throw<std::runtime_error>("Engine", "BbstageWriter", "RunDataJob",
-                                              "staging file " + stagingPath + " has size " +
-                                                  std::to_string(st.st_size) + ", expected " +
-                                                  std::to_string(dataSize) +
-                                                      " (staging file truncated or corrupted)");
-        }
-        std::vector<char> buf(DrainCopyBufferSize);
-        size_t remain = dataSize;
-        uint64_t inOff = 0;
-        uint64_t outOff = finalPos;
-        while (remain > 0)
-        {
-            if (m_DrainAbort.load(std::memory_order_relaxed))
-            {
-                // Close was requested mid-copy: stop at this chunk boundary
-                // without deleting the staging file. Everything written so
-                // far is final (same bytes, same pre-assigned offsets); the
-                // re-drain from the finalizer repeats it idempotently.
-                close(sfd);
-                return false;
-            }
-            const size_t want = std::min(remain, buf.size());
-            ssize_t n = 0;
-            do
-            {
-                n = pread(sfd, buf.data(), want, static_cast<off_t>(inOff));
-            } while (n < 0 && errno == EINTR);
-            if (n <= 0)
-            {
-                close(sfd);
-                helper::Throw<std::runtime_error>("Engine", "BbstageWriter", "RunDataJob",
-                                                  "short read of staging file " + stagingPath +
-                                                      " at " + std::to_string(inOff) + " (" +
-                                                          std::to_string(remain) +
-                                                              " bytes still due)");
-            }
-            PwriteBuffer(m_DataFd, buf.data(), static_cast<size_t>(n), outOff);
-            inOff += static_cast<uint64_t>(n);
-            outOff += static_cast<uint64_t>(n);
-            remain -= static_cast<size_t>(n);
-        }
+    //
+    // DrainStreams (default 1): the slice is copied by k concurrent disjoint
+    // range-copies into the same fd. pwrite() takes its offset per call and
+    // the ranges are disjoint, so the sub-copies need no coordination and
+    // the file content is byte-identical to k=1; the store just sees k
+    // write streams per rank instead of one. Rationale: wide OST-based
+    // stores serve a roughly fixed rate per stream, so their supply scales
+    // with the number of concurrent streams a client presents (measured
+    // ~4x aggregate throughput at 4x the streams on the production Lustre);
+    // a single stream per rank drains far below what such a store offers.
+    // All sub-copies are joined before this job is accounted drained, so
+    // the watermark, progress-record and commit protocols are exactly those
+    // of k=1. Abort and error semantics are unchanged: a stopped or failed
+    // sub-copy leaves only bytes that were final where they landed and are
+    // re-drained idempotently, and the error surfaces on the drain thread
+    // as before.
+    const int sfd = open(job.StagingPath.c_str(), O_RDONLY | O_CLOEXEC);
+    if (sfd < 0)
+    {
+        ThrowPosix("open staging file for drain " + job.StagingPath);
+    }
+    // Verify the staging file size before draining: a file left short by
+    // a crash (or overwritten by external cleanup) would otherwise
+    // surface as a confusing short read mid-copy; fail fast with both
+    // sizes instead.
+    struct stat st;
+    if (fstat(sfd, &st) != 0)
+    {
         close(sfd);
+        ThrowPosix("fstat staging file for drain " + job.StagingPath);
+    }
+    if (static_cast<size_t>(st.st_size) != job.DataSize)
+    {
+        close(sfd);
+        helper::Throw<std::runtime_error>("Engine", "BbstageWriter", "RunDataJob",
+                                          "staging file " + job.StagingPath + " has size " +
+                                              std::to_string(st.st_size) + ", expected " +
+                                                  std::to_string(job.DataSize) +
+                                                  " (staging file truncated or corrupted)");
+    }
 
-        if (m_DeleteStagedFiles)
+    // Shared state of the sub-copies: `stop` ends every range early at its
+    // next chunk boundary, set by an abort request or by any sub-copy's
+    // error; `firstError` keeps the first exception to rethrow on the drain
+    // thread (a worker-thread exception must not terminate the process);
+    // `incomplete` says at least one range did not finish, which - absent
+    // an error - means the Close abort requested it: the job then returns
+    // false and is re-queued for the finalizer's idempotent re-drain,
+    // exactly as in the single-stream path.
+    std::atomic<bool> stop{false};
+    std::atomic<bool> incomplete{false};
+    std::exception_ptr firstError;
+    std::mutex errorMutex;
+    auto recordError = [&stop, &firstError, &errorMutex](std::exception_ptr e) {
         {
-            std::error_code ec;
-            std::filesystem::remove(stagingPath, ec); // best effort
+            std::lock_guard<std::mutex> lck(errorMutex);
+            if (!firstError)
+            {
+                firstError = e;
+            }
         }
-        return true;
+        stop.store(true, std::memory_order_relaxed);
     };
 
-    if (!drainOne(job.StagingPath, job.FinalPos, job.DataSize))
+    // One sub-copy: pread/pwrite the byte range [inBegin, inEnd) of the
+    // staging file to the same range of the final slice. It owns neither
+    // the staging fd nor the staging file itself.
+    auto copyRange = [this, sfd, &job, &stop, &incomplete,
+                      &recordError](uint64_t inBegin, uint64_t inEnd) {
+        try
+        {
+            std::vector<char> buf(DrainCopyBufferSize);
+            uint64_t inOff = inBegin;
+            uint64_t outOff = job.FinalPos + inBegin;
+            while (inOff < inEnd)
+            {
+                if (stop.load(std::memory_order_relaxed) ||
+                    m_DrainAbort.load(std::memory_order_relaxed))
+                {
+                    // Close was requested mid-copy (or a sibling failed):
+                    // stop at this chunk boundary. Everything written so
+                    // far is final (same bytes, same pre-assigned
+                    // offsets); the re-drain repeats it idempotently.
+                    incomplete.store(true, std::memory_order_relaxed);
+                    stop.store(true, std::memory_order_relaxed);
+                    return;
+                }
+                const size_t want =
+                    static_cast<size_t>(std::min<uint64_t>(inEnd - inOff, buf.size()));
+                ssize_t n = 0;
+                do
+                {
+                    n = pread(sfd, buf.data(), want, static_cast<off_t>(inOff));
+                } while (n < 0 && errno == EINTR);
+                if (n <= 0)
+                {
+                    try
+                    {
+                        helper::Throw<std::runtime_error>(
+                            "Engine", "BbstageWriter", "RunDataJob",
+                            "short read of staging file " + job.StagingPath + " at " +
+                                std::to_string(inOff) + " (" + std::to_string(inEnd - inOff) +
+                                " bytes still due)");
+                    }
+                    catch (...)
+                    {
+                        recordError(std::current_exception());
+                    }
+                    return;
+                }
+                try
+                {
+                    PwriteBuffer(m_DataFd, buf.data(), static_cast<size_t>(n), outOff);
+                }
+                catch (...)
+                {
+                    recordError(std::current_exception());
+                    return;
+                }
+                inOff += static_cast<uint64_t>(n);
+                outOff += static_cast<uint64_t>(n);
+            }
+        }
+        catch (...)
+        {
+            // e.g. std::bad_alloc for the copy buffer: treat like a failed
+            // sub-copy instead of letting a worker thread terminate.
+            recordError(std::current_exception());
+        }
+    };
+
+    // Split the slice into at most m_DrainStreams ranges, boundaries
+    // rounded to copy-buffer granularity so every pread/pwrite of a
+    // sub-copy stays inside its own range; never more ranges than whole
+    // copy-buffer chunks (small slices simply drain at fewer streams).
+    unsigned int streams = m_DrainStreams;
+    uint64_t chunk = DrainCopyBufferSize;
+    if (job.DataSize > 0)
     {
-        return false;
+        const uint64_t chunks =
+            (job.DataSize + DrainCopyBufferSize - 1) / DrainCopyBufferSize;
+        if (streams > static_cast<unsigned int>(chunks))
+        {
+            streams = static_cast<unsigned int>(chunks);
+        }
+        chunk =
+            ((job.DataSize + streams - 1) / streams + DrainCopyBufferSize - 1) /
+            DrainCopyBufferSize * DrainCopyBufferSize;
+    }
+
+    const bool abortedBefore = m_DrainAbort.load(std::memory_order_relaxed);
+    if (streams <= 1)
+    {
+        copyRange(0, job.DataSize); // k=1: today's exact path, on this thread
+    }
+    else
+    {
+        std::vector<std::pair<uint64_t, uint64_t>> ranges;
+        for (uint64_t b = 0; b < job.DataSize; b += chunk)
+        {
+            ranges.emplace_back(b,
+                                std::min(b + chunk, static_cast<uint64_t>(job.DataSize)));
+        }
+        // k-1 worker threads; the drain thread runs the first range itself
+        // instead of idling in join. Thread creation cost (tens of
+        // microseconds) is negligible against a drain job (seconds).
+        std::vector<std::thread> subs;
+        subs.reserve(ranges.size() - 1);
+        for (size_t i = 1; i < ranges.size(); ++i)
+        {
+            subs.emplace_back(copyRange, ranges[i].first, ranges[i].second);
+        }
+        copyRange(ranges[0].first, ranges[0].second);
+        for (auto &t : subs)
+        {
+            t.join();
+        }
+    }
+    close(sfd);
+
+    if (firstError)
+    {
+        std::rethrow_exception(firstError);
+    }
+    if (incomplete.load(std::memory_order_relaxed) || abortedBefore)
+    {
+        return false; // Close abort mid-copy: re-queue for the finalizer
+    }
+
+    if (m_DeleteStagedFiles)
+    {
+        std::error_code ec;
+        std::filesystem::remove(job.StagingPath, ec); // best effort
     }
 
     if (m_Parameters.verbose > 2)

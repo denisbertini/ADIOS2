@@ -47,6 +47,7 @@ The output is **standard BP5**: read it back with the stock `bp5` engine,
 | `CloseMode`        | `durable` | `durable` or `staged` (see above)                                                              |
 | `StagingWatermarkMB` | `1024` | staged mode: cap on staged-but-undrained bytes; `EndStep` blocks above it until the concurrent drain catches up, then throws after `CommitTimeoutSecs` without drain progress (0 = unlimited). Per rank in both aggregation modes |
 | `DrainThreads`     | `1`     | drain worker threads per rank (run from `Open` in both close modes)                              |
+| `DrainStreams`     | `1`     | concurrent store streams per rank (max 16): the drain copies each staged slice with `k` disjoint range-writes. Same bytes, same offsets — output byte-identical to `k=1` (verified). For stores whose supply scales with stream count (see tuning notes); decide from `drain-stats`, not from guesswork |
 | `CommitTimeoutSecs`| `300`   | give up waiting on a stuck peer rank after this long (0 = forever); in staged mode also the stall timeout of the watermark backpressure |
 | `Aggregate`        | `off`   | `on`: node-aggregated co-write drain. Local staging stays per-rank; the SSD -> final-store drain writes one `data.<node>` sub-file per node that every rank on the node co-writes (each rank drains its own slices at pre-assigned disjoint offsets: one store client per rank, one file per node). Data sub-file count scales with node count, not rank count. Off critical path. Must be uniform across ranks |
 | `StagingPreallocate` | `off` | `on`: `fallocate` each staging file at `EndStep`, **only when the staging tier is tmpfs** (e.g. `BurstBufferPath=/dev/shm`): one batched allocation replaces tmpfs per-page faults in the spill (measured ~6x faster on RZ /dev/shm; the spill @ column of `BBSTAGE_TIMING` shows it), and a RAM-budget overrun fails fast with a clear error before any partial write. Ignored (with a warning) on block-filesystem tiers, where it is a measured no-op |
@@ -55,6 +56,7 @@ When bbstage is reached through middleware that cannot pass engine
 parameters (e.g. the WarpX checkpoint path via openPMD-api), these
 environment variables act as fallbacks (precedence: parameter > env var >
 default): `BBSTAGE_CLOSE_MODE`, `BBSTAGE_STAGING_WATERMARK_MB`,
+`BBSTAGE_DRAIN_STREAMS`,
 `BBSTAGE_AGGREGATE` (`on`/`off`), `BBSTAGE_STAGING_PREALLOCATE`
 (`on`/`off`),
 `BBSTAGE_TIMING` (=1: per-phase Open/EndStep/Close timing and per-rank drain
@@ -130,6 +132,20 @@ Full parameter list, protocol semantics, and limitations:
   memory-tight jobs, stay on /tmp: its page cache degrades gracefully.
   `StagingSync` is meaningless on tmpfs (fsync is a no-op — there is no
   device); durability stays `bbstage.final` on the final store either way.
+- **Store supply scales with stream count (measured supply curves, two
+  Lustres):** production Lustre (800+ OSTs, ~5-6 MiB/s *per stream*, thin
+  per-OST): 256 concurrent writers → ~1.2 GiB/s, 512 → 2.5-3.4, 1024 →
+  4.2-6.8 GiB/s — near-linear with writer count, sustained (30 s windows,
+  100 GiB landed), ±40% hour-to-hour. The archive-class store (16 wide
+  OSTs) is the opposite shape: ~640 MiB/s at any concurrency from 256 up
+  (width-limited, saturated). "Filesystem speed" is therefore not a
+  constant: supply ≈ per-stream rate × streams the client presents, up to
+  the OST-width limit. An 8-node bbstage job drains 256 streams (one per
+  rank) and so uses ~1/5 of what production offered at 4x the streams:
+  `DrainStreams=k` splits each rank's drain copy into k concurrent
+  disjoint range-writes to recover that (byte-identity local-tested; the
+  store-side win is decided by `drain-stats` A/B per arm, since it exists
+  precisely for stores with this shape).
 - **Tuning notes:** use the default watermark (1 GiB) for production — it
   self-throttles the app when the store cannot keep up and keeps /tmp
   usage and the exit tail small; a huge watermark (e.g. 64 GiB) instead

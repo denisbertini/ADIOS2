@@ -111,6 +111,13 @@ bbstage-specific parameters:
 | DrainThreads       | 1       | Drain worker threads per rank (max 16); run   |
 |                    |         | from ``Open`` in both close modes             |
 +--------------------+---------+-----------------------------------------------+
+| DrainStreams       | 1       | Concurrent store streams per rank (max 16):   |
+|                    |         | the drain copies each staged slice with k     |
+|                    |         | disjoint range-writes (byte-identical output, |
+|                    |         | verified). Useful on stores whose supply      |
+|                    |         | scales with stream count (wide OST Lustre);   |
+|                    |         | check ``drain-stats``, do not guess           |
++--------------------+---------+-----------------------------------------------+
 | StagingSync        | false   | ``fsync`` the staging file inside ``EndStep`` |
 +--------------------+---------+-----------------------------------------------+
 | StagingPreallocate | false   | ``fallocate`` the staging file at ``EndStep``,|
@@ -178,6 +185,9 @@ environment variable > default.
 +--------------------------+---------------------------------------------+
 | ``BBSTAGE_STAGING_WA-    | watermark in MiB                            |
 | TERMARK_MB``             | (``StagingWatermarkMB``)                    |
++--------------------------+---------------------------------------------+
+| ``BBSTAGE_DRAIN_STREAMS``| concurrent drain streams per rank           |
+|                          | (``DrainStreams``)                          |
 +--------------------------+---------------------------------------------+
 | ``BBSTAGE_STAGING_PRE-   | ``on``/``off`` (``StagingPreallocate``)     |
 | ALLOCATE``               |                                             |
