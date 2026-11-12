@@ -111,12 +111,16 @@ bbstage-specific parameters:
 | DrainThreads       | 1       | Drain worker threads per rank (max 16); run   |
 |                    |         | from ``Open`` in both close modes             |
 +--------------------+---------+-----------------------------------------------+
-| DrainStreams       | 1       | Concurrent store streams per rank (max 16):   |
-|                    |         | the drain copies each staged slice with k     |
-|                    |         | disjoint range-writes (byte-identical output, |
-|                    |         | verified). Useful on stores whose supply      |
-|                    |         | scales with stream count (wide OST Lustre);   |
-|                    |         | check ``drain-stats``, do not guess           |
+| DrainStreams       | 1       | Measured demotion: keep the default. A        |
+|                    |         | fat-rank A/B (1/4/8 streams) found drain      |
+|                    |         | throughput flat in k, while writers paid      |
+|                    |         | ~+20% checkpoint wall and 2-4x jitter.        |
+|                    |         | One large sequential stream per file          |
+|                    |         | already amortizes the per-file fixed cost     |
+|                    |         | that makes small files look bandwidth-        |
+|                    |         | capped. Use k>1 only where a store really     |
+|                    |         | throttles per file (single-OST, per-stream    |
+|                    |         | client caps); see ``drain-stats``.            |
 +--------------------+---------+-----------------------------------------------+
 | StagingSync        | false   | ``fsync`` the staging file inside ``EndStep`` |
 +--------------------+---------+-----------------------------------------------+

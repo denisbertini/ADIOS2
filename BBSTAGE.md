@@ -1,5 +1,9 @@
 # bbstage — node-local staging + asynchronous drain BP5 engine (fork addition)
 
+> **📖 Full documentation (quickstart, parameters, semantics, measured
+> tuning constants): <https://denisbertini.github.io/bbstage-docs/>** —
+> this file is the in-repo overview.
+
 **bbstage** is a write-only ADIOS2 engine added by this fork. It decouples the
 application-visible checkpoint cost from the (slow) final store: each step is
 spilled synchronously to fast node-local media (NVMe/SSD), and per-process
@@ -47,7 +51,7 @@ The output is **standard BP5**: read it back with the stock `bp5` engine,
 | `CloseMode`        | `durable` | `durable` or `staged` (see above)                                                              |
 | `StagingWatermarkMB` | `1024` | staged mode: cap on staged-but-undrained bytes; `EndStep` blocks above it until the concurrent drain catches up, then throws after `CommitTimeoutSecs` without drain progress (0 = unlimited). Per rank in both aggregation modes |
 | `DrainThreads`     | `1`     | drain worker threads per rank (run from `Open` in both close modes)                              |
-| `DrainStreams`     | `1`     | concurrent store streams per rank (max 16): the drain copies each staged slice with `k` disjoint range-writes. Same bytes, same offsets — output byte-identical to `k=1` (verified). For stores whose supply scales with stream count (see tuning notes); decide from `drain-stats`, not from guesswork |
+| `DrainStreams`     | `1`     | concurrent store streams per rank (max 16): the drain copies each staged slice with `k` disjoint range-writes. Same bytes, same offsets — output byte-identical to `k=1` (verified). **Keep the default: measured demotion.** A fat-rank A/B (8 ranks = 1/node, ~944 MiB/rank checkpoints, per-rank demand above the small-file lane rate) found drain throughput FLAT in k (k=1/4/8 within +-7%) while writer wall-time cost ~+20% and jitter 2-4x worse at k>=4 — one large sequential stream per file already amortizes the per-file fixed cost that small files make look like a bandwidth ceiling. k>1 remains only for stores with a genuine per-file throughput throttle (single-OST targets, per-stream client caps) — absent from the measured systems; leave at 1 unless your `drain-stats` say otherwise |
 | `CommitTimeoutSecs`| `300`   | give up waiting on a stuck peer rank after this long (0 = forever); in staged mode also the stall timeout of the watermark backpressure |
 | `Aggregate`        | `off`   | `on`: node-aggregated co-write drain. Local staging stays per-rank; the SSD -> final-store drain writes one `data.<node>` sub-file per node that every rank on the node co-writes (each rank drains its own slices at pre-assigned disjoint offsets: one store client per rank, one file per node). Data sub-file count scales with node count, not rank count. Off critical path. Must be uniform across ranks |
 | `StagingPreallocate` | `off` | `on`: `fallocate` each staging file at `EndStep`, **only when the staging tier is tmpfs** (e.g. `BurstBufferPath=/dev/shm`): one batched allocation replaces tmpfs per-page faults in the spill (measured ~6x faster on RZ /dev/shm; the spill @ column of `BBSTAGE_TIMING` shows it), and a RAM-budget overrun fails fast with a clear error before any partial write. Ignored (with a warning) on block-filesystem tiers, where it is a measured no-op |
