@@ -168,7 +168,10 @@ Full parameter list, protocol semantics, and limitations:
   phases.
 - Design lineage: the staging + background-drain approach follows
   [BBView](https://github.com/tsukuba-hpcs/bbview) (Koyama & Tatebe,
-  REX-IO 2025), implemented fully in-process. There is no view
+  "BBView: A View-Aware Burst-Buffer Mechanism for MPI-IO", REX-IO /
+  IEEE Cluster 2025, doi:10.1109/CLUSTERWorkshops65972.2025.11164194;
+  journal version doi:10.1587/transinf.2026PAP0001), implemented fully
+  in-process. There is no view
   transformation: the staged payload is already serialized in final BP5
   layout, so the background work is a byte copy plus a deferred metadata
   commit.
