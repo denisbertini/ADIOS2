@@ -127,9 +127,11 @@ bbstage-specific parameters:
 | StagingPreallocate | false   | ``fallocate`` the staging file at ``EndStep``,|
 |                    |         | but only when the staging tier is tmpfs: one  |
 |                    |         | batched allocation replaces per-page faults in|
-|                    |         | the spill (measured ~6x faster), and a RAM-   |
-|                    |         | budget overrun fails fast before any partial  |
-|                    |         | write. Ignored with a warning on block F/S.   |
+|                    |         | the spill (measured 1.4x by a dd probe        |
+|                    |         | [j14042], up to ~6x engine spill, node-       |
+|                    |         | dependent: probe), and a RAM-budget overrun   |
+|                    |         | fails fast before any partial write. Ignored  |
+|                    |         | with a warning on block F/S.                  |
 +--------------------+---------+-----------------------------------------------+
 | DrainDataSync      | false   | ``fsync`` the final data file at each         |
 |                    |         | ``Flush()``/``Close()`` drain barrier         |
