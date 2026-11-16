@@ -22,6 +22,7 @@
 #include <cctype>
 #include <cerrno>
 #include <chrono>
+#include <cmath> // isinf
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -345,7 +346,11 @@ void BbstageWriter::InitParameters()
         {
             char *end = nullptr;
             const float v = std::strtof(envTimeout.c_str(), &end);
-            if (end == envTimeout.c_str() || *end != '\0' || v < 0.f)
+            // !(v >= 0) catches NaN (all comparisons false); isinf rejects
+            // overflow spellings (1e400) that would silently disable the
+            // fuse while looking enabled.
+            if (end == envTimeout.c_str() || *end != '\0' || !(v >= 0.f) ||
+                std::isinf(v))
             {
                 helper::Throw<std::invalid_argument>("Engine", "BbstageWriter", "InitParameters",
                                                      "BBSTAGE_COMMIT_TIMEOUT_SECS must be a "
