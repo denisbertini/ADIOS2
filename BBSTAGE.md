@@ -61,6 +61,9 @@ parameters (e.g. the WarpX checkpoint path via openPMD-api), these
 environment variables act as fallbacks (precedence: parameter > env var >
 default): `BBSTAGE_CLOSE_MODE`, `BBSTAGE_STAGING_WATERMARK_MB`,
 `BBSTAGE_DRAIN_STREAMS`,
+`BBSTAGE_COMMIT_TIMEOUT_SECS` (non-negative number; rate the watchdog above
+the worst legitimate drain stall of the target store — observed: ~10 min
+Lustre stalls trip the 300 s default on a healthy-but-stalled store),
 `BBSTAGE_AGGREGATE` (`on`/`off`), `BBSTAGE_STAGING_PREALLOCATE`
 (`on`/`off`),
 `BBSTAGE_TIMING` (=1: per-phase Open/EndStep/Close timing and per-rank drain

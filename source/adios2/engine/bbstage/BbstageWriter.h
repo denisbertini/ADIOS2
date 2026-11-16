@@ -123,7 +123,9 @@ namespace engine
  *                       timeout of the staging watermark backpressure:
  *                       EndStep() blocked at the watermark throws after
  *                       this long without drain progress instead of
- *                       hanging.
+ *                       hanging. Env fallback BBSTAGE_COMMIT_TIMEOUT_SECS
+ *                       (middleware paths); rate it above the worst
+ *                       legitimate drain stall of the target store.
  *   DeleteStagedFiles   remove staging files once drained (default true)
  *   CloseMode           "durable" (default) or "staged". Staged: the drain
  *                       workers run concurrently from Open (exactly as in

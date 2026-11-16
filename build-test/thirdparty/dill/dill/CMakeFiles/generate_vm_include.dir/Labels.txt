@@ -1,0 +1,6 @@
+# Directory labels
+ DILL
+# Source files and their labels
+/home/denis/work/io/ADIOS2/build-test/thirdparty/dill/dill/CMakeFiles/generate_vm_include
+/home/denis/work/io/ADIOS2/build-test/thirdparty/dill/dill/CMakeFiles/generate_vm_include.rule
+/home/denis/work/io/ADIOS2/build-test/thirdparty/dill/dill/dill_virtual.c.rule

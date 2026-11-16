@@ -332,7 +332,31 @@ void BbstageWriter::InitParameters()
         m_CommitPollMs = static_cast<unsigned int>(u);
     }
     float f = 0.f;
-    if (helper::GetParameter(lower, "committimeoutsecs", f))
+    bool haveCommitTimeout = helper::GetParameter(lower, "committimeoutsecs", f);
+    if (!haveCommitTimeout)
+    {
+        // Env fallback: the watchdog is the one parameter a middleware path
+        // (WarpX via openPMD-api) may legitimately need to re-rate for store
+        // weather (observed: legitimate drain stalls of ~10 min on Lustre
+        // exceeded the 300 s fuse and tripped it on healthy-but-stalled
+        // stores). 0 = wait forever (fuse disabled).
+        std::string envTimeout;
+        if (helper::GetEnv("BBSTAGE_COMMIT_TIMEOUT_SECS", envTimeout) && !envTimeout.empty())
+        {
+            char *end = nullptr;
+            const float v = std::strtof(envTimeout.c_str(), &end);
+            if (end == envTimeout.c_str() || *end != '\0' || v < 0.f)
+            {
+                helper::Throw<std::invalid_argument>("Engine", "BbstageWriter", "InitParameters",
+                                                     "BBSTAGE_COMMIT_TIMEOUT_SECS must be a "
+                                                     "non-negative number, got '" +
+                                                         envTimeout + "'");
+            }
+            f = v;
+            haveCommitTimeout = true;
+        }
+    }
+    if (haveCommitTimeout)
     {
         m_CommitTimeoutSecs = f;
     }

@@ -1,0 +1,88 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "/home/denis/work/io/ADIOS2/thirdparty/ffs/ffs/ffs/ffs.c"
+		},
+		{
+			"file" : "/home/denis/work/io/ADIOS2/thirdparty/ffs/ffs/ffs/ffs_formats.c"
+		},
+		{
+			"file" : "/home/denis/work/io/ADIOS2/thirdparty/ffs/ffs/ffs/ffs_conv.c"
+		},
+		{
+			"file" : "/home/denis/work/io/ADIOS2/thirdparty/ffs/ffs/ffs/ffs_gen.c"
+		},
+		{
+			"file" : "/home/denis/work/io/ADIOS2/thirdparty/ffs/ffs/ffs/ffs_file.c"
+		},
+		{
+			"file" : "/home/denis/work/io/ADIOS2/thirdparty/ffs/ffs/ffs/evol.c"
+		},
+		{
+			"file" : "/home/denis/work/io/ADIOS2/thirdparty/ffs/ffs/ffs/ffs_marshal.c"
+		},
+		{
+			"file" : "/home/denis/work/io/ADIOS2/thirdparty/ffs/ffs/version.c"
+		},
+		{
+			"file" : "/home/denis/work/io/ADIOS2/thirdparty/ffs/ffs/fm/fm_formats.c"
+		},
+		{
+			"file" : "/home/denis/work/io/ADIOS2/thirdparty/ffs/ffs/fm/fm_dump.c"
+		},
+		{
+			"file" : "/home/denis/work/io/ADIOS2/thirdparty/ffs/ffs/fm/lookup3.c"
+		},
+		{
+			"file" : "/home/denis/work/io/ADIOS2/thirdparty/ffs/ffs/fm/string_conversion.c"
+		},
+		{
+			"file" : "/home/denis/work/io/ADIOS2/thirdparty/ffs/ffs/fm/fm_get.c"
+		},
+		{
+			"file" : "/home/denis/work/io/ADIOS2/thirdparty/ffs/ffs/fm/xml.c"
+		},
+		{
+			"file" : "/home/denis/work/io/ADIOS2/thirdparty/ffs/ffs/fm/server_acts.c"
+		},
+		{
+			"file" : "/home/denis/work/io/ADIOS2/thirdparty/ffs/ffs/fm/unix_io.c"
+		},
+		{
+			"file" : "/home/denis/work/io/ADIOS2/thirdparty/ffs/ffs/fm/http_client.c"
+		},
+		{
+			"file" : "/home/denis/work/io/ADIOS2/thirdparty/ffs/ffs/cod/cg.c"
+		},
+		{
+			"file" : "/home/denis/work/io/ADIOS2/thirdparty/ffs/ffs/cod/standard.c"
+		},
+		{
+			"file" : "/home/denis/work/io/ADIOS2/build-test/thirdparty/ffs/ffs/cod.tab.c"
+		},
+		{
+			"file" : "/home/denis/work/io/ADIOS2/build-test/thirdparty/ffs/ffs/cod_node.c"
+		},
+		{
+			"file" : "/home/denis/work/io/ADIOS2/build-test/thirdparty/ffs/ffs/structs.h"
+		},
+		{
+			"file" : "/home/denis/work/io/ADIOS2/build-test/thirdparty/ffs/ffs/cod.tab.c.rule"
+		},
+		{
+			"file" : "/home/denis/work/io/ADIOS2/build-test/thirdparty/ffs/ffs/cod_node.c.rule"
+		},
+		{
+			"file" : "/home/denis/work/io/ADIOS2/build-test/thirdparty/ffs/ffs/lex.yy.c.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"FFS"
+		],
+		"name" : "ffs"
+	}
+}

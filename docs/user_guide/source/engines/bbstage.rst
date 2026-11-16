@@ -195,6 +195,10 @@ environment variable > default.
 | ``BBSTAGE_DRAIN_STREAMS``| concurrent drain streams per rank           |
 |                          | (``DrainStreams``)                          |
 +--------------------------+---------------------------------------------+
+| ``BBSTAGE_COMMIT_TIME-`` | watchdog timeout in seconds                 |
+| ``OUT_SECS``             | (``CommitTimeoutSecs``); rate above the     |
+|                          | worst legitimate drain stall of the store   |
++--------------------------+---------------------------------------------+
 | ``BBSTAGE_STAGING_PRE-   | ``on``/``off`` (``StagingPreallocate``)     |
 | ALLOCATE``               |                                             |
 +--------------------------+---------------------------------------------+

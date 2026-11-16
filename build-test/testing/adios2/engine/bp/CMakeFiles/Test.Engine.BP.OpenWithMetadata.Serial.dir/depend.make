@@ -1,0 +1,2 @@
+# Empty dependencies file for Test.Engine.BP.OpenWithMetadata.Serial.
+# This may be replaced when dependencies are built.

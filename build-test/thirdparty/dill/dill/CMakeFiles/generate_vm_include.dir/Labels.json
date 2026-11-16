@@ -1,0 +1,22 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "/home/denis/work/io/ADIOS2/build-test/thirdparty/dill/dill/CMakeFiles/generate_vm_include"
+		},
+		{
+			"file" : "/home/denis/work/io/ADIOS2/build-test/thirdparty/dill/dill/CMakeFiles/generate_vm_include.rule"
+		},
+		{
+			"file" : "/home/denis/work/io/ADIOS2/build-test/thirdparty/dill/dill/dill_virtual.c.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"DILL"
+		],
+		"name" : "generate_vm_include"
+	}
+}

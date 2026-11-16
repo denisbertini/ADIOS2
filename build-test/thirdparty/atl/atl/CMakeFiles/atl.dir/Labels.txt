@@ -1,0 +1,7 @@
+# Directory labels
+ ATL
+# Source files and their labels
+/home/denis/work/io/ADIOS2/thirdparty/atl/atl/atom.cpp
+/home/denis/work/io/ADIOS2/thirdparty/atl/atl/attr.c
+/home/denis/work/io/ADIOS2/thirdparty/atl/atl/lookup3.c
+/home/denis/work/io/ADIOS2/thirdparty/atl/atl/http_atom_client.c

@@ -1,0 +1,51 @@
+# SPDX-FileCopyrightText: 2026 Oak Ridge National Laboratory and Contributors
+#
+# SPDX-License-Identifier: Apache-2.0
+
+
+set(CTEST_CUSTOM_MAXIMUM_NUMBER_OF_ERRORS 1000)
+set(CTEST_CUSTOM_MAXIMUM_NUMBER_OF_WARNINGS 1000)
+
+list(APPEND CTEST_CUSTOM_WARNING_EXCEPTION
+  "H5PL\\.c.*dlopen.*glibc"
+  "gtest\\.cc.*getaddrinfo.*glibc"
+  ".*/thirdparty/.*"
+  "warning: Using '.*' in statically linked applications requires at runtime the shared libraries from the glibc version used for linking"
+  "PGC.*compilation completed with warnings"
+  "Warning: stand-alone `data16' prefix"
+  "Warning: Type mismatch between actual argument.*"
+  "Warning: Rank mismatch between actual argument.*"
+  "zfp/types.h.*typedef"
+  "was built for newer macOS version"
+  "warning generated"
+  "warnings generated"
+  "warning: template parameter ... is not used in declaring the parameter types of function template"
+  "warning: command-line option '.*' is valid for Fortran but not for C"
+  "Warning #20208-D: '.*' is treated as '.*' in device code"
+  "Warning: '.*' is treated as '.*' in device code"
+  ".*was specified as both a system and non-system include directory.*"
+  "Wunused-command-line-argument"
+  "ld: warning: -undefined dynamic_lookup may not work with chained fixups"
+  "ld: warning: ignoring duplicate libraries:"
+  # CMake>=4 add this flag that some compilers do not understand
+  "icpc: command line warning #10006: ignoring unknown option '-fstack-clash-protection'"
+  "icc: command line warning #10006: ignoring unknown option '-fstack-clash-protection'"
+  "warning: dereferencing type-punned pointer will break strict-aliasing rules"
+)
+list(APPEND CTEST_CUSTOM_COVERAGE_EXCLUDE
+  ".*/thirdparty/.*"
+  ".*/testing/.*"
+  ".*/examples/.*"
+)
+
+if (x86_64 STREQUAL "ppc64le")
+
+# Exclude flaky tests for now
+list(APPEND CTEST_CUSTOM_TESTS_IGNORE
+  "Interface.ADIOSInterface.ADIOSNoMpi.Serial"
+  "Interface.ADIOS2_CXX_API_MultiBlock/*.Put.Serial"
+  "Interface.ADIOS2_CXX_API_IO.EngineDefault.Serial"
+  "Interface.ADIOS2_CXX_API_IO.Engine.Serial"
+)
+
+endif()

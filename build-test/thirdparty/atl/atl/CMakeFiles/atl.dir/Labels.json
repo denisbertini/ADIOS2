@@ -1,0 +1,25 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "/home/denis/work/io/ADIOS2/thirdparty/atl/atl/atom.cpp"
+		},
+		{
+			"file" : "/home/denis/work/io/ADIOS2/thirdparty/atl/atl/attr.c"
+		},
+		{
+			"file" : "/home/denis/work/io/ADIOS2/thirdparty/atl/atl/lookup3.c"
+		},
+		{
+			"file" : "/home/denis/work/io/ADIOS2/thirdparty/atl/atl/http_atom_client.c"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"ATL"
+		],
+		"name" : "atl"
+	}
+}

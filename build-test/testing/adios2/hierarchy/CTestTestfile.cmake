@@ -1,0 +1,12 @@
+# CMake generated Testfile for 
+# Source directory: /home/denis/work/io/ADIOS2/testing/adios2/hierarchy
+# Build directory: /home/denis/work/io/ADIOS2/build-test/testing/adios2/hierarchy
+# 
+# This file includes the relevant testing commands required for 
+# testing this directory and lists subdirectories to be tested as well.
+add_test(Engine.BP.ADIOSHierarchicalReadVariableTest.Read.BP3.Serial "/home/denis/work/io/ADIOS2/build-test/bin/Test.Engine.BP.HierarchicalReading.Serial" "--gtest_filter=ADIOSHierarchicalReadVariableTest.Read" "BP3")
+set_tests_properties(Engine.BP.ADIOSHierarchicalReadVariableTest.Read.BP3.Serial PROPERTIES  _BACKTRACE_TRIPLES "/home/denis/work/io/ADIOS2/cmake/upstream/GoogleTest.cmake;227;add_test;/home/denis/work/io/ADIOS2/testing/CMakeLists.txt;83;gtest_add_tests;/home/denis/work/io/ADIOS2/testing/adios2/engine/bp/CMakeLists.txt;73;gtest_add_tests_helper;/home/denis/work/io/ADIOS2/testing/adios2/hierarchy/CMakeLists.txt;10;bp_gtest_add_tests_helper;/home/denis/work/io/ADIOS2/testing/adios2/hierarchy/CMakeLists.txt;0;")
+add_test(Engine.BP.ADIOSHierarchicalReadVariableTest.Read.BP4.Serial "/home/denis/work/io/ADIOS2/build-test/bin/Test.Engine.BP.HierarchicalReading.Serial" "--gtest_filter=ADIOSHierarchicalReadVariableTest.Read" "BP4")
+set_tests_properties(Engine.BP.ADIOSHierarchicalReadVariableTest.Read.BP4.Serial PROPERTIES  _BACKTRACE_TRIPLES "/home/denis/work/io/ADIOS2/cmake/upstream/GoogleTest.cmake;227;add_test;/home/denis/work/io/ADIOS2/testing/CMakeLists.txt;83;gtest_add_tests;/home/denis/work/io/ADIOS2/testing/adios2/engine/bp/CMakeLists.txt;76;gtest_add_tests_helper;/home/denis/work/io/ADIOS2/testing/adios2/hierarchy/CMakeLists.txt;10;bp_gtest_add_tests_helper;/home/denis/work/io/ADIOS2/testing/adios2/hierarchy/CMakeLists.txt;0;")
+add_test(Engine.BP.ADIOSHierarchicalReadVariableTest.Read.BP5.Serial "/home/denis/work/io/ADIOS2/build-test/bin/Test.Engine.BP.HierarchicalReading.Serial" "--gtest_filter=ADIOSHierarchicalReadVariableTest.Read" "BP5")
+set_tests_properties(Engine.BP.ADIOSHierarchicalReadVariableTest.Read.BP5.Serial PROPERTIES  _BACKTRACE_TRIPLES "/home/denis/work/io/ADIOS2/cmake/upstream/GoogleTest.cmake;227;add_test;/home/denis/work/io/ADIOS2/testing/CMakeLists.txt;83;gtest_add_tests;/home/denis/work/io/ADIOS2/testing/adios2/engine/bp/CMakeLists.txt;79;gtest_add_tests_helper;/home/denis/work/io/ADIOS2/testing/adios2/hierarchy/CMakeLists.txt;10;bp_gtest_add_tests_helper;/home/denis/work/io/ADIOS2/testing/adios2/hierarchy/CMakeLists.txt;0;")

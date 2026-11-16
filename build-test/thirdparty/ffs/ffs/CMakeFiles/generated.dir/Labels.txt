@@ -1,0 +1,8 @@
+# Directory labels
+ FFS
+# Source files and their labels
+/home/denis/work/io/ADIOS2/build-test/thirdparty/ffs/ffs/CMakeFiles/generated
+/home/denis/work/io/ADIOS2/build-test/thirdparty/ffs/ffs/CMakeFiles/generated.rule
+/home/denis/work/io/ADIOS2/build-test/thirdparty/ffs/ffs/cod.tab.c.rule
+/home/denis/work/io/ADIOS2/build-test/thirdparty/ffs/ffs/cod_node.c.rule
+/home/denis/work/io/ADIOS2/build-test/thirdparty/ffs/ffs/lex.yy.c.rule

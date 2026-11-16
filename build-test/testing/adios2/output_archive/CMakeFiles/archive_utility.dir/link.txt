@@ -1,0 +1,1 @@
+/usr/bin/cc -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/archive_utility.dir/link.d CMakeFiles/archive_utility.dir/archive_utility.c.o -o ../../../bin/archive_utility
