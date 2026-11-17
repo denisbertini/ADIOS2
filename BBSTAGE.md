@@ -53,6 +53,13 @@ The output is **standard BP5**: read it back with the stock `bp5` engine,
 | `DrainThreads`     | `1`     | drain worker threads per rank (run from `Open` in both close modes)                              |
 | `DrainStreams`     | `1`     | concurrent store streams per rank (max 16): the drain copies each staged slice with `k` disjoint range-writes. Same bytes, same offsets — output byte-identical to `k=1` (verified). **Keep the default: measured demotion.** A fat-rank A/B (8 ranks = 1/node, ~944 MiB/rank checkpoints, per-rank demand above the small-file lane rate) found drain throughput FLAT in k (k=1/4/8 within +-7%) while writer wall-time cost ~+20% and jitter 2-4x worse at k>=4 — one large sequential stream per file already amortizes the per-file fixed cost that small files make look like a bandwidth ceiling. k>1 remains only for stores with a genuine per-file throughput throttle (single-OST targets, per-stream client caps) — absent from the measured systems; leave at 1 unless your `drain-stats` say otherwise |
 | `CommitTimeoutSecs`| `300`   | give up waiting on a stuck peer rank after this long (0 = forever); in staged mode also the stall timeout of the watermark backpressure |
+| `StoreBreaker`     | `off`   | `on`: store circuit breaker (see Notes). Off: the drain path is byte-identical to pre-breaker code |
+| `BreakerProbePath` | `<final dir>/bbstage.probe` | health-probe sentinel file on the final store (8 bytes, persistent fd, data I/O only — no per-probe create/unlink metadata churn) |
+| `BreakerDownAfterSecs` | `30` | sustained probe errors (or a stale probe heartbeat — the stalled-store signature) before the store is declared Down |
+| `BreakerSlowAfterSecs` | `5` | probe-latency EWMA above this marks the store Slow (informational: drain keeps running at full rate) |
+| `BreakerProbeSeconds` | `1` | healthy probe cadence; backs off exponentially (to 15 s) while Down |
+| `BreakerUpAfterProbes` | `3` | consecutive clean probes required to leave Down (one lucky fast answer must not reopen the flood gates) |
+| `BreakerHardWatermarkMB` | `0` | staged mode: backpressure release target while the store is Down (due checkpoints wait on the staging tier); `0` = 2x `StagingWatermarkMB`. Size it to what the burst tier can actually hold |
 | `Aggregate`        | `off`   | `on`: node-aggregated co-write drain. Local staging stays per-rank; the SSD -> final-store drain writes one `data.<node>` sub-file per node that every rank on the node co-writes (each rank drains its own slices at pre-assigned disjoint offsets: one store client per rank, one file per node). Data sub-file count scales with node count, not rank count. Off critical path. Must be uniform across ranks |
 | `StagingPreallocate` | `off` | `on`: `fallocate` each staging file at `EndStep`, **only when the staging tier is tmpfs** (e.g. `BurstBufferPath=/dev/shm`): one batched allocation replaces tmpfs per-page faults in the spill (measured 1.4x for a `dd` probe on current nodes [j14042], up to ~6x for the engine's own spill in its dev-era measurement — node-class-dependent: probe; the spill @ column of `BBSTAGE_TIMING` shows it), and a RAM-budget overrun fails fast with a clear error before any partial write. Ignored (with a warning) on block-filesystem tiers, where it is a measured no-op |
 
@@ -65,7 +72,10 @@ default): `BBSTAGE_CLOSE_MODE`, `BBSTAGE_STAGING_WATERMARK_MB`,
 the worst legitimate drain stall of the target store — observed: ~10 min
 Lustre stalls trip the 300 s default on a healthy-but-stalled store),
 `BBSTAGE_AGGREGATE` (`on`/`off`), `BBSTAGE_STAGING_PREALLOCATE`
-(`on`/`off`),
+(`on`/`off`), `BBSTAGE_STORE_BREAKER` (`on`/`off`),
+`BBSTAGE_BREAKER_PROBE_PATH` (sentinel file path),
+`BBSTAGE_BREAKER_DOWN_AFTER_SECS` (positive number),
+`BBSTAGE_BREAKER_HARD_WATERMARK_MB` (non-negative integer MiB),
 `BBSTAGE_TIMING` (=1: per-phase Open/EndStep/Close timing and per-rank drain
 throughput lines on stderr).
 
@@ -97,6 +107,54 @@ Full parameter list, protocol semantics, and limitations:
   of the non-aggregated layout at the file count of aggregate. The
   multi-client single-file pattern is the same one BP5's own aggregator
   chains use.
+- **Store circuit breaker** (`StoreBreaker=on`, default `off` — with the
+  breaker off every drain path is byte-identical to pre-breaker code):
+  motivated by measured whole-filesystem stalls (observed: ~10 min Lustre
+  stalls on an otherwise healthy store, which trip the 300 s
+  `CommitTimeoutSecs` fuse and abort runs whose data was fine). The breaker
+  lets bbstage *notice* such a stall, stop issuing new final-store writes,
+  hold the due checkpoints on the staging NVMe, and resume the drain when
+  the store returns — instead of paying either a false-positive timeout
+  abort or an unbounded hang. Each rank runs a health oracle fed by two
+  independent signals, so one bad sensor cannot trip it: (i) an active
+  probe — an 8-byte sentinel (`bbstage.probe` in the checkpoint directory)
+  on one persistent fd, round-tripped `pwrite` + `fdatasync` + `pread` by a
+  dedicated thread (`fdatasync` cannot be answered from the client page
+  cache, so a stalled store blocks the probe exactly as it blocks the
+  drain); (ii) passive telemetry — failed drain jobs feed the same error
+  window (a small-file probe can look fine while multi-GiB writes crawl,
+  and vice versa). The D-state rule: on a real stall the probe's own
+  syscalls are stuck in the kernel and cannot report anything, so liveness
+  is measured by the **probe thread's heartbeat** — consumers (which are
+  never stuck) derive Down from a stale heartbeat; every consumer-visible
+  field is an atomic and the probe thread never holds a lock across a store
+  operation. While Down: drain dispatch pauses *before job pickup* (a job
+  already dequeued always finishes — invariant); the watermark release
+  target expands to `BreakerHardWatermarkMB` so the simulation keeps
+  computing on NVMe; transient store errors (EIO, ETIMEDOUT, ESTALE,
+  EAGAIN, ...) **requeue the job** instead of aborting the run (staging
+  file intact, same bytes at the same pre-assigned offsets — the identical
+  safety argument as the drain-abort rewind; budget 16 requeues guards
+  against a permanent error misclassified as weather); lagging progress
+  publishes are deferred and re-driven after recovery (a session only
+  becomes done once its record has landed, so a reader can never see a step
+  whose record was lost); every timeout fuse counts only time with the
+  store answering (the clock restarts during an outage — the fuse measures
+  post-recovery behavior, which is what it is for). Leaving Down requires
+  `BreakerUpAfterProbes` consecutive clean probes: one lucky fast answer on
+  a flapping store does not reopen the flood gates. Permanent errnos
+  (ENOSPC, EDQUOT, EINVAL, ENOENT, ...) always fail fast — retrying cannot
+  fix them. `StoreBreaker=on` validates the probe path with a synchronous
+  round-trip at `Open` (a misconfiguration is a configuration error, and
+  from then on every probe failure is weather). Honest limits: the breaker
+  protects the in-run path and the staged watermark; it does not make a
+  `durable` `Close()` non-blocking (that already waits on the drain — it
+  just waits patiently and requeues now), and a walltime-aware finalize
+  deadline for staged mode is separate planned work. The sentinel file is
+  8 bytes and lives in the checkpoint directory beside the drain progress
+  records; every rank probes it through its own fd (identical payload, so
+  concurrent ranks do not disturb each other's read-back), and the probe
+  recreates the file if a fresh Open of the same name unlinks it.
 - **Field validation (RZ Lustre, 8 nodes x 32 ranks, 64 GiB/checkpoint,
   10 checkpoints, both engines in one job minutes apart):** with the store
   contended (native BP5 managed only 2.5 GiB/s), staged + aggregate ran

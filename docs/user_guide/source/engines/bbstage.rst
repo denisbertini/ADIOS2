@@ -97,6 +97,55 @@ staged-and-drained output is ordinary BP5::
 
 Readers may simply use ``bp5`` (or ``bbstage``), streaming or random access.
 
+Store circuit breaker
+---------------------
+
+Whole-filesystem stalls happen on shared parallel stores (observed:
+~10 min Lustre stalls on an otherwise healthy filesystem). Without the
+breaker such a stall forces a choice between two failure modes: timeout
+fuses that abort a healthy-but-stalled run, or an unbounded hang. With
+``StoreBreaker=on`` (default ``off``) the engine notices the stall, sheds
+store load, rides the outage out on the staging tier, and resumes the drain
+by itself when the store returns:
+
+* Each rank runs a health oracle fed by two independent signals, so one
+  bad sensor cannot trip it. The active probe round-trips an 8-byte
+  sentinel (``bbstage.probe`` in the checkpoint directory, one persistent
+  fd, data I/O only -- no per-probe create/unlink metadata churn) with
+  ``pwrite`` + ``fdatasync`` + ``pread`` on a dedicated thread: the
+  ``fdatasync`` cannot be answered from the client page cache, so a
+  stalled store blocks the probe exactly as it blocks the drain. Failed
+  drain jobs feed the same error window as passive telemetry (a
+  small-file probe can look fine while multi-GiB writes crawl, and vice
+  versa).
+* The D-state rule: on a real stall the probe's own syscalls are stuck in
+  the kernel and can report nothing -- the only visible trace is the
+  probe thread's heartbeat going stale. So consumers derive Down from a
+  stale heartbeat or a sustained error streak (``BreakerDownAfterSecs``),
+  in lock-free code that never runs on the stuck thread itself.
+* While Down: new drain jobs are not dispatched (a job already dequeued
+  always finishes -- invariant); the staged watermark release target
+  expands to ``BreakerHardWatermarkMB`` so due checkpoints wait on the
+  staging tier and the simulation keeps computing; transient store errors
+  (EIO, ETIMEDOUT, ESTALE, EAGAIN, ...) requeue the job instead of
+  aborting the run, and lagging progress publishes re-drive after
+  recovery (a session completes only once its progress record has
+  landed); every timeout fuse counts only time with the store answering
+  -- the clock restarts during an outage, so the fuse measures
+  post-recovery behavior, which is all it can meaningfully judge.
+* Recovery requires ``BreakerUpAfterProbes`` consecutive clean probes: one
+  lucky fast answer on a flapping store does not reopen the flood gates.
+  Permanent errnos (ENOSPC, EDQUOT, EINVAL, ENOENT, ...) always fail fast
+  -- retrying cannot fix them. ``Open`` validates the probe path with a
+  synchronous round-trip, so a misconfiguration is an Open error and every
+  probe failure afterwards is weather.
+
+Honest limits: the breaker protects the in-run path and the staged
+watermark. It does not make a ``durable`` ``Close()`` non-blocking (it
+waits patiently and requeues now), and a walltime-aware finalize deadline
+for staged mode is separate work. With the breaker ``off`` every drain
+path is byte-identical to breaker-less behavior.
+
 Engine parameters
 -----------------
 
@@ -176,6 +225,46 @@ bbstage-specific parameters:
 |                    |         | uniform across ranks                          |
 +--------------------+---------+-----------------------------------------------+
 
+Store circuit breaker parameters (all take effect only with
+``StoreBreaker=on``):
+
++------------------------+---------------+-----------------------------------------------+
+| Parameter              | Default       | Description                                   |
++========================+===============+===============================================+
+| StoreBreaker           | off           | ``on``: store circuit breaker (see the        |
+|                        |               | section above): notice final-store stalls,    |
+|                        |               | pause new drain dispatch, hold due            |
+|                        |               | checkpoints on the staging tier, requeue      |
+|                        |               | transient store errors, resume on             |
+|                        |               | recovery. Off (default): the drain path       |
+|                        |               | is byte-identical to breaker-less behavior    |
++------------------------+---------------+-----------------------------------------------+
+| BreakerProbePath       | finalDir/     | health-probe sentinel on the final store      |
+|                        | bbstage.probe | (8 bytes, one persistent fd per rank,         |
+|                        |               | ``pwrite`` + ``fdatasync`` + ``pread`` --     |
+|                        |               | data I/O only, no per-probe metadata churn    |
++------------------------+---------------+-----------------------------------------------+
+| BreakerDownAfterSecs   | 30            | sustained probe errors (or a stale probe      |
+|                        |               | heartbeat: the stalled-store signature)       |
+|                        |               | before the store is declared Down             |
++------------------------+---------------+-----------------------------------------------+
+| BreakerSlowAfterSecs   | 5             | probe-latency EWMA above this marks the       |
+|                        |               | store Slow (informational; the drain          |
+|                        |               | keeps running at full rate)                   |
++------------------------+---------------+-----------------------------------------------+
+| BreakerProbeSeconds    | 1             | healthy probe cadence in seconds; backs       |
+|                        |               | off exponentially to 15 s while Down          |
++------------------------+---------------+-----------------------------------------------+
+| BreakerUpAfterProbes   | 3             | consecutive clean probes required to          |
+|                        |               | leave Down (one lucky fast answer on a        |
+|                        |               | flapping store must not reopen the gates)     |
++------------------------+---------------+-----------------------------------------------+
+| BreakerHardWatermarkMB | 0             | staged mode: backpressure release target      |
+|                        |               | while the store is Down (due checkpoints      |
+|                        |               | wait on the staging tier); 0 = 2x             |
+|                        |               | ``StagingWatermarkMB``                        |
++------------------------+---------------+-----------------------------------------------+
+
 Environment variables
 ~~~~~~~~~~~~~~~~~~~~~
 
@@ -207,6 +296,18 @@ environment variable > default.
 |                          | lines to stderr (default: off)              |
 +--------------------------+---------------------------------------------+
 | ``BBSTAGE_AGGREGATE``    | ``on``/``off`` (``Aggregate``)              |
++--------------------------+---------------------------------------------+
+| ``BBSTAGE_STORE_``       | ``on``/``off`` (``StoreBreaker``)           |
+| ``BREAKER``              |                                             |
++--------------------------+---------------------------------------------+
+| ``BBSTAGE_BREAKER_``     | sentinel file path (``BreakerProbePath``)   |
+| ``PROBE_PATH``           |                                             |
++--------------------------+---------------------------------------------+
+| ``BBSTAGE_BREAKER_``-    | watchdog seconds of sustained store errors  |
+| ``DOWN_AFTER_SECS``      | before Down (``BreakerDownAfterSecs``)      |
++--------------------------+---------------------------------------------+
+| ``BBSTAGE_BREAKER_``-    | hard watermark in MiB while the store is    |
+| ``HARD_WATERMARK_MB``    | Down (``BreakerHardWatermarkMB``)           |
 +--------------------------+---------------------------------------------+
 
 Shared BP5 parameters are honored where they apply:
