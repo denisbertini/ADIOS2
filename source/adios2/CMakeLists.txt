@@ -343,6 +343,7 @@ if(NOT WIN32)
     engine/bbstage/BbstageWriter.cpp
     engine/bbstage/BbstageDrainCommon.cpp
     engine/bbstage/BbstageStagedFinalizer.cpp
+    engine/bbstage/BbstageStoreHealth.cpp
   )
   target_compile_definitions(adios2_core PRIVATE ADIOS2_HAVE_BBSTAGE)
 endif()
