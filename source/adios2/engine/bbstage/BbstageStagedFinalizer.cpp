@@ -6,6 +6,7 @@
 
 #include "BbstageStagedFinalizer.h"
 
+#include "BbstageStoreHealth.h"
 #include "adios2/engine/bp5/BP5Engine.h" // m_ActiveFlagPosition
 
 #include <algorithm>
@@ -46,7 +47,10 @@ bool StagedTimingEnabled()
 
 [[noreturn]] void ThrowPosix(const std::string &what)
 {
-    throw std::runtime_error("bbstage finalizer: " + what + ": " + std::strerror(errno));
+    // BbstagePosixError IS a std::runtime_error with the same message: only
+    // the errno payload is new (store-breaker retry classification).
+    const int err = errno;
+    throw BbstagePosixError(err, "bbstage finalizer: " + what + ": " + std::strerror(errno));
 }
 
 void PwriteAll(int fd, const char *ptr, size_t size, uint64_t offset)
@@ -91,6 +95,13 @@ void BbstageStagedFinalizer::SetStagingStallTimeout(float secs)
     m_StagingStallTimeoutSecs = secs;
 }
 
+void BbstageStagedFinalizer::SetStoreBreaker(bool on, uint64_t downWatermarkBytes)
+{
+    std::lock_guard<std::mutex> lck(m_Mutex);
+    m_StoreBreaker = on;
+    m_StoreDownWatermark = downWatermarkBytes;
+}
+
 void BbstageStagedFinalizer::AccountStaged(uint64_t bytes)
 {
     const auto now = [] { return std::chrono::steady_clock::now(); };
@@ -112,13 +123,25 @@ void BbstageStagedFinalizer::AccountStaged(uint64_t bytes)
             std::chrono::duration<float>(m_StagingStallTimeoutSecs));
         uint64_t pendingMin = m_PendingStaged;
         auto lastProgress = now();
+        bool downLogged = false;
         for (;;)
         {
             if (m_Error != nullptr)
             {
                 break;
             }
-            if (m_PendingStaged <= m_StagingWatermark - bytes)
+            // Store breaker: while the final store is Down, the release
+            // target is the (larger) hard watermark: due checkpoints wait on
+            // the staging NVMe and the simulation keeps computing. Once the
+            // store is back the target returns to the nominal watermark by
+            // itself — no reconfiguration, no restart.
+            const bool breakerDown =
+                m_StoreBreaker &&
+                BbstageStoreHealth::Instance().State() == BbstageStoreHealthState::Down;
+            const uint64_t limit = (breakerDown && m_StoreDownWatermark > m_StagingWatermark)
+                                       ? m_StoreDownWatermark
+                                       : m_StagingWatermark;
+            if (m_PendingStaged <= limit - bytes)
             {
                 break; // the new bytes fit under the watermark
             }
@@ -133,14 +156,35 @@ void BbstageStagedFinalizer::AccountStaged(uint64_t bytes)
                 // has made no progress for the whole stall timeout: waiting
                 // longer will not help. Report it instead of hanging.
                 std::ostringstream err;
-                err << "bbstage staged close: staging watermark of "
-                    << m_StagingWatermark << " bytes reached with " << m_PendingStaged
+                err << "bbstage staged close: staging watermark of " << limit
+                    << " bytes reached with " << m_PendingStaged
                     << " bytes still pending and no drain progress for "
                     << m_StagingStallTimeoutSecs << " s; the drain to the final "
                     "store is stalled (slow or unreachable final store, or "
                     "a burst buffer that the run cannot keep below the "
                     "watermark)";
+                if (m_StoreBreaker)
+                {
+                    err << " [store breaker: final store "
+                        << (breakerDown ? "DOWN" : "reachable")
+                        << "; even the hard watermark could not absorb the backlog]";
+                }
                 throw std::runtime_error(err.str());
+            }
+            if (breakerDown && !downLogged)
+            {
+                downLogged = true;
+                std::fprintf(stderr,
+                             "[bbstage staged rank breaker] holding %llu MiB of due "
+                             "checkpoints on staging (hard limit %llu MiB) while the final "
+                             "store is down\n",
+                             static_cast<unsigned long long>(m_PendingStaged >> 20),
+                             static_cast<unsigned long long>(limit >> 20));
+                std::fflush(stderr);
+            }
+            else if (!breakerDown)
+            {
+                downLogged = false;
             }
             m_StagingCV.wait_for(lck, std::chrono::milliseconds(100));
         }
@@ -194,13 +238,20 @@ void BbstageStagedFinalizer::RegisterSession(Session session)
     // before the hand-off: no job is left for the drain worker to complete,
     // so DataDone would never be set and the session could never be
     // finalized. Detect the already-drained state here; the degenerate
-    // zero-step session is a special case of it.
-    if (session.DrainedWatermark >= session.NextDataSeq && session.DataQueue.empty())
+    // zero-step session is a special case of it. Publish-last: a breaker-
+    // deferred in-session publish rides along the hand-off (PublishedSteps
+    // < DrainedWatermark) — done and its close-out wait for the record.
+    if (session.DrainedWatermark >= session.NextDataSeq && session.DataQueue.empty() &&
+        session.DrainedWatermark == session.PublishedSteps)
     {
         session.DataDone = true;
     }
     auto sp = std::make_shared<Session>(std::move(session));
     m_Sessions.push_back(sp);
+    if (sp->DrainedWatermark > sp->PublishedSteps)
+    {
+        m_PendingRepublish = sp; // delivered by the drain worker when the store is back
+    }
     if (sp->DataDone)
     {
         // The workers only run the data-side cleanup (fsync, close fds,
@@ -400,8 +451,42 @@ void BbstageStagedFinalizer::RunDataJob(Session &s, BbstageDrainJob &job)
     }
 }
 
-void BbstageStagedFinalizer::PublishProgress(Session &s)
+int BbstageStagedFinalizer::AdvanceSessionLocked(Session &s)
 {
+    int ret = 0;
+    if (s.DrainedWatermark > s.PublishedSteps)
+    {
+        // Aggregate co-write: this rank's record is node-local (the node
+        // leader folds it into the node record); otherwise the record goes
+        // straight to the final store.
+        if (s.Aggregate)
+        {
+            PublishLocalProgress(s);
+        }
+        else
+        {
+            PublishProgress(s);
+        }
+        s.PublishedSteps = s.DrainedWatermark;
+        ret |= 1;
+    }
+    if (s.Aggregate && s.IsNodeLeader && s.NodePublishedSteps < s.NextDataSeq)
+    {
+        // Fold the node's local records into the node record (self-gating:
+        // no-op when the node's drained minimum has not advanced).
+        PublishNodeRecord(s);
+        ret |= 1;
+    }
+    if (!s.DataDone && s.DrainedWatermark >= s.NextDataSeq && s.DataQueue.empty() &&
+        s.DrainedWatermark == s.PublishedSteps)
+    {
+        s.DataDone = true;
+        ret |= 2;
+    }
+    return ret;
+}
+
+void BbstageStagedFinalizer::PublishProgress(Session &s){
     // Called under m_Mutex by the single drain worker, so no two threads can
     // race the lazy create or the sequence counter.
     if (s.ProgressFd < 0)
@@ -527,9 +612,14 @@ void BbstageStagedFinalizer::DrainWorkerLoop()
     std::shared_ptr<Session> stallSession;
     uint64_t stallSteps = 0;
     std::chrono::steady_clock::time_point stallStart = std::chrono::steady_clock::now();
+    // breaker: consecutive requeues without a completed job (budget against
+    // a misclassified permanent error; reset on every success)
+    int jobRetries = 0;
+    constexpr int maxJobRetries = 16;
     for (;;)
     {
         std::shared_ptr<Session> s;
+        std::shared_ptr<Session> republishDone;
         BbstageDrainJob job;
         bool have = false;
         {
@@ -560,13 +650,43 @@ void BbstageStagedFinalizer::DrainWorkerLoop()
             }
             else
             {
-                m_DataCV.wait(lck, [this] {
-                    return m_Error != nullptr || m_Finishing ||
-                           std::any_of(m_Sessions.begin(), m_Sessions.end(),
-                                       [](const std::shared_ptr<Session> &x) {
-                                           return !x->DataQueue.empty();
-                                       });
-                });
+                // Store breaker: hold dispatch while the store is Down —
+                // queues keep their jobs (staging holds the bytes, the
+                // simulation is unaffected above the hard watermark). The
+                // gate never waits on the probe thread's CV alone: bounded
+                // polling sees recovery even when the probe is itself stuck
+                // in the kernel (the one state where it can notify nobody).
+                if (m_StoreBreaker)
+                {
+                    while (!m_Error && !m_Finishing &&
+                           !BbstageStoreHealth::Instance().StoreReady())
+                    {
+                        m_DataCV.wait_for(lck, std::chrono::milliseconds(200));
+                    }
+                }
+                if (m_PendingRepublish != nullptr)
+                {
+                    // a deferred progress record is due work: the wait must
+                    // stay bounded so it gets re-driven after the recovery
+                    // even with an otherwise idle queue
+                    m_DataCV.wait_for(lck, std::chrono::milliseconds(200), [this] {
+                        return m_Error != nullptr || m_Finishing ||
+                               std::any_of(m_Sessions.begin(), m_Sessions.end(),
+                                           [](const std::shared_ptr<Session> &x) {
+                                               return !x->DataQueue.empty();
+                                           });
+                    });
+                }
+                else
+                {
+                    m_DataCV.wait(lck, [this] {
+                        return m_Error != nullptr || m_Finishing ||
+                               std::any_of(m_Sessions.begin(), m_Sessions.end(),
+                                           [](const std::shared_ptr<Session> &x) {
+                                               return !x->DataQueue.empty();
+                                           });
+                    });
+                }
             }
             if (m_Error)
             {
@@ -620,6 +740,8 @@ void BbstageStagedFinalizer::DrainWorkerLoop()
                                 stallStart = std::chrono::steady_clock::now();
                             }
                             else if (x->CommitTimeoutSecs > 0.f &&
+                                     !(m_StoreBreaker &&
+                                       !BbstageStoreHealth::Instance().StoreReady()) &&
                                      (std::chrono::steady_clock::now() - stallStart) >
                                          std::chrono::duration_cast<
                                              std::chrono::steady_clock::duration>(
@@ -636,7 +758,18 @@ void BbstageStagedFinalizer::DrainWorkerLoop()
                         }
                         catch (...)
                         {
-                            if (!m_Error)
+                            // A lagging node record costs nothing to redo:
+                            // while the breaker holds the store Down, swallow
+                            // the publish failure (it republishes on the next
+                            // completion after recovery) instead of aborting
+                            // the session; with the breaker off or the store
+                            // up, this is a real error as before.
+                            if (m_StoreBreaker && !BbstageStoreHealth::Instance().StoreReady())
+                            {
+                                BbstageStoreHealth::Instance().ObserveFailure();
+                                m_PendingRepublish = x; // re-driven after recovery
+                            }
+                            else if (!m_Error)
                             {
                                 m_Error = std::current_exception();
                             }
@@ -644,15 +777,59 @@ void BbstageStagedFinalizer::DrainWorkerLoop()
                         published = true;
                     }
                 }
+                if (!published && m_PendingRepublish != nullptr &&
+                    BbstageStoreHealth::Instance().StoreReady())
+                {
+                    // breaker recovery: deliver the record deferred during the
+                    // outage (cumulative values, so this republishes whatever
+                    // the drain pass could not publish; may newly complete the
+                    // session)
+                    try
+                    {
+                        const int adv = AdvanceSessionLocked(*m_PendingRepublish);
+                        if (m_PendingRepublish->PublishedSteps >=
+                            m_PendingRepublish->DrainedWatermark)
+                        {
+                            republishDone = m_PendingRepublish;
+                            m_PendingRepublish = nullptr;
+                        }
+                        if (adv != 0)
+                        {
+                            published = true;
+                        }
+                    }
+                    catch (...)
+                    {
+                        // still flapping: stay pending, retry next tick
+                        if (m_StoreBreaker &&
+                            !BbstageStoreHealth::Instance().StoreReady())
+                        {
+                            BbstageStoreHealth::Instance().ObserveFailure();
+                        }
+                        else if (!m_Error)
+                        {
+                            m_Error = std::current_exception();
+                        }
+                    }
+                }
                 if (published)
                 {
                     EraseDoneSessions(); // a just-completed node may release its session
                 }
-                if (m_Finishing && !published)
+                if (m_Finishing && !published && m_PendingRepublish == nullptr)
                 {
                     return; // process exiting and nothing left to drain or publish
                 }
             }
+        }
+        if (republishDone != nullptr)
+        {
+            // deferred completion landed after an outage: same data-side
+            // close-out a normal drain completion performs
+            CompleteSessionData(*republishDone);
+            std::lock_guard<std::mutex> lck(m_Mutex);
+            EraseDoneSessions();
+            m_CommitCV.notify_all();
         }
         if (!have)
         {
@@ -662,109 +839,135 @@ void BbstageStagedFinalizer::DrainWorkerLoop()
         }
 
         const auto tDrainStart = std::chrono::steady_clock::now();
+        std::exception_ptr jobError;
+        bool drained = false;
         try
         {
             RunDataJob(*s, job);
+            drained = true;
         }
         catch (...)
         {
-            {
-                std::lock_guard<std::mutex> lck(m_Mutex);
-                if (!m_Error)
-                {
-                    m_Error = std::current_exception();
-                }
-            }
-            m_DataCV.notify_all();
-            m_CommitCV.notify_all();
-            m_StagingCV.notify_all();
-            return;
+            jobError = std::current_exception();
         }
-
-        bool justDone = false;
-        try
+        if (!drained)
         {
+            // Store breaker: a transient store error on a path that passed
+            // the Open preflight is weather. The job is requeued untouched
+            // (staging file intact, not accounted, same bytes at the same
+            // pre-assigned offsets — the identical safety argument as the
+            // engine's m_DrainAbort rewind), the oracle learns about the
+            // failure, and the store gate holds further dispatch until the
+            // store is back. Permanent errnos, breaker-off runs, a running
+            // teardown, and budget exhaustion keep the original abort.
+            const int err = BbstagePosixErrnoOf(jobError);
+            bool finishing = false;
             {
                 std::lock_guard<std::mutex> lck(m_Mutex);
-                s->DoneDataSeqs.insert(job.Seq);
-                while (s->DoneDataSeqs.count(s->DrainedWatermark) != 0)
-                {
-                    s->DoneDataSeqs.erase(s->DrainedWatermark);
-                    ++s->DrainedWatermark;
-                }
-                s->ProgressBytes += job.DataSize;
-                // drain throughput stats (BBSTAGE_TIMING), under m_Mutex
-                ++s->DrainJobs;
-                s->DrainBytes += job.DataSize;
-                s->DrainSecs += std::chrono::duration<double>(
-                                    std::chrono::steady_clock::now() - tDrainStart)
-                                    .count();
-                if (s->DrainedWatermark > s->PublishedSteps)
-                {
-                    // Aggregate co-write: this rank's record is node-local
-                    // (the node leader folds it into the node record);
-                    // otherwise the record goes straight to the final store.
-                    if (s->Aggregate)
-                    {
-                        PublishLocalProgress(*s);
-                    }
-                    else
-                    {
-                        PublishProgress(*s);
-                    }
-                    s->PublishedSteps = s->DrainedWatermark;
-                }
-                if (s->Aggregate && s->IsNodeLeader)
-                {
-                    // Fold the node's local records into the node record
-                    // (no-op when the node's drained minimum has not
-                    // advanced).
-                    PublishNodeRecord(*s);
-                }
-                if (m_PendingStaged >= job.DataSize)
-                {
-                    m_PendingStaged -= job.DataSize;
-                }
-                else
-                {
-                    m_PendingStaged = 0;
-                }
-                if (!s->DataDone && s->DrainedWatermark >= s->NextDataSeq &&
-                    s->DataQueue.empty())
-                {
-                    s->DataDone = true;
-                    justDone = true;
-                }
+                finishing = m_Finishing;
             }
-            m_StagingCV.notify_all();
-            if (justDone)
+            if (m_StoreBreaker && err != 0 && BbstageStoreErrorRetryable(err) && !finishing)
             {
-                // outside the lock: data-side session cleanup (single actor)
-                CompleteSessionData(*s);
-                // release sessions fully done on this rank (rank != 0 has no
-                // commit worker, so this worker is the only reclaimer there);
-                // an aggregate node leader session is kept while its node
-                // record is still behind (it must keep publishing until the
-                // whole node has drained)
+                ++jobRetries;
+                BbstageStoreHealth::Instance().ObserveFailure();
+                if (jobRetries <= maxJobRetries)
                 {
                     std::lock_guard<std::mutex> lck(m_Mutex);
-                    EraseDoneSessions();
+                    s->DataQueue.push_front(std::move(job));
+                    continue;
                 }
             }
-        }
-        catch (...)
-        {
             {
                 std::lock_guard<std::mutex> lck(m_Mutex);
                 if (!m_Error)
                 {
-                    m_Error = std::current_exception();
+                    m_Error = jobError;
                 }
             }
             m_DataCV.notify_all();
             m_CommitCV.notify_all();
             m_StagingCV.notify_all();
             return;
+        }
+        jobRetries = 0;
+
+        bool justDone = false;
+        {
+            // accounting: pure memory ops, cannot fail, must not be lost to a
+            // publish error
+            std::lock_guard<std::mutex> lck(m_Mutex);
+            s->DoneDataSeqs.insert(job.Seq);
+            while (s->DoneDataSeqs.count(s->DrainedWatermark) != 0)
+            {
+                s->DoneDataSeqs.erase(s->DrainedWatermark);
+                ++s->DrainedWatermark;
+            }
+            s->ProgressBytes += job.DataSize;
+            // drain throughput stats (BBSTAGE_TIMING), under m_Mutex
+            ++s->DrainJobs;
+            s->DrainBytes += job.DataSize;
+            s->DrainSecs += std::chrono::duration<double>(
+                                std::chrono::steady_clock::now() - tDrainStart)
+                                .count();
+            if (m_PendingStaged >= job.DataSize)
+            {
+                m_PendingStaged -= job.DataSize;
+            }
+            else
+            {
+                m_PendingStaged = 0;
+            }
+        }
+        try
+        {
+            std::lock_guard<std::mutex> lck(m_Mutex);
+            const int adv = AdvanceSessionLocked(*s);
+            justDone = (adv & 2) != 0;
+            if (m_PendingRepublish == s)
+            {
+                m_PendingRepublish = nullptr; // this session delivered everything
+            }
+        }
+        catch (...)
+        {
+            // Progress publish failed. A lagging record costs nothing to
+            // redo (records are cumulative), so while the breaker holds the
+            // store down this is deferred, not fatal: the session stays not
+            // done (publish-last: DataDone requires the record landed) and is
+            // re-driven from the idle path once the store is back.
+            if (m_StoreBreaker && !BbstageStoreHealth::Instance().StoreReady())
+            {
+                BbstageStoreHealth::Instance().ObserveFailure();
+                std::lock_guard<std::mutex> lck(m_Mutex);
+                m_PendingRepublish = s;
+            }
+            else
+            {
+                std::lock_guard<std::mutex> lck(m_Mutex);
+                if (!m_Error)
+                {
+                    m_Error = std::current_exception();
+                }
+                m_DataCV.notify_all();
+                m_CommitCV.notify_all();
+                m_StagingCV.notify_all();
+                return;
+            }
+        }
+        m_StagingCV.notify_all();
+        if (justDone)
+        {
+            // outside the lock: data-side session cleanup (single actor)
+            CompleteSessionData(*s);
+            // release sessions fully done on this rank (rank != 0 has no
+            // commit worker, so this worker is the only reclaimer there);
+            // an aggregate node leader session is kept while its node
+            // record is still behind (it must keep publishing until the
+            // whole node has drained)
+            {
+                std::lock_guard<std::mutex> lck(m_Mutex);
+                EraseDoneSessions();
+            }
         }
         m_DataCV.notify_all();
         m_CommitCV.notify_all();
@@ -794,11 +997,19 @@ void BbstageStagedFinalizer::RunCommitJob(Session &s, const BbstageDrainJob &job
 
 void BbstageStagedFinalizer::WaitForSessionDrained(Session &s, size_t step)
 {
-    const auto start = std::chrono::steady_clock::now();
+    auto start = std::chrono::steady_clock::now(); // breaker-patience restarts it
     const bool forever = (s.CommitTimeoutSecs <= 0.f);
     const auto timeout = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
         std::chrono::duration<float>(s.CommitTimeoutSecs));
     const auto poll = std::chrono::milliseconds(s.CommitPollMs);
+    // Store breaker: while the shared final store is held down these waits
+    // are intentional (dispatch and records are deferred by design), so the
+    // fuse measures nothing useful. It counts only time with the store
+    // answering: the clock restarts on every patient iteration, giving the
+    // full timeout after a recovery.
+    const auto breakerPatient = [&s] {
+        return s.StoreBreaker && !BbstageStoreHealth::Instance().StoreReady();
+    };
 
     // own drain state first (in-memory)
     for (;;)
@@ -814,7 +1025,11 @@ void BbstageStagedFinalizer::WaitForSessionDrained(Session &s, size_t step)
                 break;
             }
         }
-        if (!forever && (std::chrono::steady_clock::now() - start) > timeout)
+        if (breakerPatient())
+        {
+            start = std::chrono::steady_clock::now();
+        }
+        else if (!forever && (std::chrono::steady_clock::now() - start) > timeout)
         {
             throw std::runtime_error("bbstage finalizer: timeout waiting for own drain of "
                                      "step " + std::to_string(step) + " of " + s.FinalDir);
@@ -846,7 +1061,11 @@ void BbstageStagedFinalizer::WaitForSessionDrained(Session &s, size_t step)
             {
                 break;
             }
-            if (!forever && (std::chrono::steady_clock::now() - start) > timeout)
+            if (breakerPatient())
+            {
+                start = std::chrono::steady_clock::now();
+            }
+            else if (!forever && (std::chrono::steady_clock::now() - start) > timeout)
             {
                 throw std::runtime_error("bbstage finalizer: timeout waiting for drain of "
                                          "step " + std::to_string(step) +

@@ -6,6 +6,7 @@
 
 #include "BbstageWriter.h"
 
+#include "BbstageStoreHealth.h"
 #include "adios2/common/ADIOSMacros.h"
 #include "adios2/core/IO.h"
 #include "adios2/helper/adiosFunctions.h"
@@ -82,8 +83,19 @@ void ThrowPosix(const std::string &what)
     // helper::Throw (adiosLog.h) always throws, so control never returns from
     // here; it carries no [[noreturn]] attribute, so neither does this
     // wrapper (compilers cannot prove the throw through the template).
-    helper::Throw<std::runtime_error>("Engine", "BbstageWriter", what,
-                                      what + ": " + std::string(std::strerror(errno)));
+    // The thrown exception is re-wrapped as BbstagePosixError (still a
+    // std::runtime_error, message preserved) to carry the errno for the
+    // store breaker's retry classification.
+    const int err = errno;
+    try
+    {
+        helper::Throw<std::runtime_error>("Engine", "BbstageWriter", what,
+                                          what + ": " + std::string(std::strerror(errno)));
+    }
+    catch (const std::runtime_error &e)
+    {
+        throw BbstagePosixError(err, e.what());
+    }
 }
 
 // BBSTAGE_TIMING=1 enables per-phase Open/Close timing lines on stderr
@@ -368,6 +380,105 @@ void BbstageWriter::InitParameters()
     if (helper::GetParameter(lower, "deletestagedfiles", s))
     {
         m_DeleteStagedFiles = (s == "true" || s == "on" || s == "1");
+    }
+    // Store circuit breaker: on a whole-store stall the staged drain pauses
+    // (load shedding), due checkpoints wait on the staging NVMe under a
+    // raised hard watermark, transient store errors requeue, and the drain
+    // resumes when the probe says the store is back. Default off: byte-
+    // identical pre-breaker behavior.
+    {
+        std::string breaker;
+        if (!helper::GetParameter(lower, "storebreaker", breaker))
+        {
+            std::string envBreaker;
+            if (helper::GetEnv("BBSTAGE_STORE_BREAKER", envBreaker))
+            {
+                breaker = envBreaker;
+            }
+        }
+        if (!breaker.empty())
+        {
+            if (breaker == "on" || breaker == "true" || breaker == "1")
+            {
+                m_StoreBreaker = true;
+            }
+            else if (breaker == "off" || breaker == "false" || breaker == "0")
+            {
+                m_StoreBreaker = false;
+            }
+            else
+            {
+                helper::Throw<std::invalid_argument>("Engine", "BbstageWriter", "InitParameters",
+                                                     "StoreBreaker must be 'on' or 'off', got '" +
+                                                         breaker + "'");
+            }
+        }
+    }
+    if (helper::GetParameter(lower, "breakerprobepath", s))
+    {
+        m_BreakerProbePath = s;
+    }
+    else
+    {
+        std::string envProbe;
+        if (helper::GetEnv("BBSTAGE_BREAKER_PROBE_PATH", envProbe) && !envProbe.empty())
+        {
+            m_BreakerProbePath = envProbe;
+        }
+    }
+    if (helper::GetParameter(lower, "breakerslowaftersecs", f))
+    {
+        m_BreakerSlowAfterSecs = f;
+    }
+    if (helper::GetParameter(lower, "breakerdownaftersecs", f))
+    {
+        m_BreakerDownAfterSecs = f;
+    }
+    else
+    {
+        std::string envDown;
+        if (helper::GetEnv("BBSTAGE_BREAKER_DOWN_AFTER_SECS", envDown) && !envDown.empty())
+        {
+            char *end = nullptr;
+            const float v = std::strtof(envDown.c_str(), &end);
+            if (end == envDown.c_str() || *end != '\0' || !(v > 0.f) || std::isinf(v))
+            {
+                helper::Throw<std::invalid_argument>(
+                    "Engine", "BbstageWriter", "InitParameters",
+                    "BBSTAGE_BREAKER_DOWN_AFTER_SECS must be a positive number, got '" + envDown +
+                        "'");
+            }
+            m_BreakerDownAfterSecs = v;
+        }
+    }
+    if (helper::GetParameter(lower, "breakerprobeseconds", f))
+    {
+        m_BreakerProbeSecs = f;
+    }
+    if (helper::GetParameter(lower, "breakerupafterprobes", u))
+    {
+        m_BreakerUpAfterProbes = static_cast<unsigned int>(u);
+    }
+    if (helper::GetParameter(lower, "breakerhardwatermarkmb", u))
+    {
+        m_BreakerHardWatermarkBytes = static_cast<uint64_t>(u) << 20;
+    }
+    else
+    {
+        std::string envHard;
+        if (helper::GetEnv("BBSTAGE_BREAKER_HARD_WATERMARK_MB", envHard) && !envHard.empty())
+        {
+            char *end = nullptr;
+            const unsigned long long v = std::strtoull(envHard.c_str(), &end, 10);
+            if (end == envHard.c_str() || *end != '\0')
+            {
+                helper::Throw<std::invalid_argument>(
+                    "Engine", "BbstageWriter", "InitParameters",
+                    "BBSTAGE_BREAKER_HARD_WATERMARK_MB must be a non-negative integer, got '" +
+                        envHard + "'");
+            }
+            m_BreakerHardWatermarkBytes = v << 20;
+        }
     }
     // Environment variable fallbacks: bbstage is often reached through
     // middleware (e.g. the WarpX checkpoint path via openPMD-api) where the
@@ -718,6 +829,40 @@ void BbstageWriter::InitTransports()
 
     m_Comm.Barrier();
     openPhase("barrier2");
+    if (m_StoreBreaker)
+    {
+        // Health oracle on the final store. Configure() runs a synchronous
+        // preflight round-trip: an unusable probe path surfaces here as an
+        // Open error, so from this point on every probe failure is weather.
+        // One oracle per process (one final store per run): the first
+        // enabled engine configures it, later engines share it.
+        auto &health = BbstageStoreHealth::Instance();
+        BbstageStoreHealth::Config cfg;
+        cfg.Enabled = true;
+        cfg.ProbePath =
+            m_BreakerProbePath.empty() ? finalDir + "/bbstage.probe" : m_BreakerProbePath;
+        cfg.SlowAfterSecs = m_BreakerSlowAfterSecs;
+        cfg.DownAfterSecs = m_BreakerDownAfterSecs;
+        cfg.UpAfterProbes = m_BreakerUpAfterProbes;
+        cfg.ProbeIntervalSecs = m_BreakerProbeSecs;
+        cfg.Rank = m_RankMPI;
+        if (!health.Configure(cfg))
+        {
+            helper::Throw<std::invalid_argument>(
+                "Engine", "BbstageWriter", "InitTransports",
+                "StoreBreaker=on but the health probe cannot run: " + health.LastError());
+        }
+        if (m_CloseModeStaged)
+        {
+            // Backpressure release target while the store is Down (the
+            // staging NVMe absorbs the due checkpoints): default is twice
+            // the nominal watermark; size it to what the burst tier can
+            // actually hold with BreakerHardWatermarkMB.
+            BbstageStagedFinalizer::Instance().SetStoreBreaker(
+                true, m_BreakerHardWatermarkBytes != 0 ? m_BreakerHardWatermarkBytes
+                                                       : 2 * m_StagingWatermarkBytes);
+        }
+    }
     if (m_CloseModeStaged)
     {
         // staged close: the drain workers run concurrently from Open (as in
@@ -1108,6 +1253,10 @@ void BbstageWriter::WorkerLoop()
     const auto nodePublishPending = [this] {
         return m_Aggregate && m_IsLeader && m_PublishedNodeSteps < m_NextDataSeq;
     };
+    // store breaker: consecutive requeued jobs without a success (budget
+    // against a permanent error misclassified as weather; reset per success)
+    int jobRetries = 0;
+    constexpr int maxJobRetries = 16;
     for (;;)
     {
         DrainJob job;
@@ -1123,6 +1272,20 @@ void BbstageWriter::WorkerLoop()
             }
             else
             {
+                // Store breaker: hold dispatch while the store is Down —
+                // the queue keeps its jobs (bytes wait on the staging NVMe,
+                // the simulation is unaffected above the hard watermark) and
+                // the drain resumes at full rate on recovery. Bounded poll:
+                // recovery is noticed even when the probe thread is itself
+                // stuck in the kernel and can notify nobody.
+                if (m_StoreBreaker)
+                {
+                    while (!m_Finishing && m_DrainError == nullptr &&
+                           !BbstageStoreHealth::Instance().StoreReady())
+                    {
+                        m_DataCV.wait_for(lck, std::chrono::milliseconds(200));
+                    }
+                }
                 m_DataCV.wait(lck, [this] {
                     return m_Finishing || m_DrainError != nullptr || !m_DataQueue.empty();
                 });
@@ -1152,7 +1315,13 @@ void BbstageWriter::WorkerLoop()
                 }
                 catch (...)
                 {
-                    if (!m_DrainError)
+                    // node record is cumulative and folds again on the next
+                    // pass: defer while the breaker holds the store down
+                    if (m_StoreBreaker && !BbstageStoreHealth::Instance().StoreReady())
+                    {
+                        BbstageStoreHealth::Instance().ObserveFailure();
+                    }
+                    else if (!m_DrainError)
                     {
                         m_DrainError = std::current_exception();
                     }
@@ -1168,23 +1337,55 @@ void BbstageWriter::WorkerLoop()
 
         const auto tDrainStart = std::chrono::steady_clock::now();
         bool completed = false;
+        std::exception_ptr jobError;
         try
         {
             completed = RunDataJob(job);
         }
         catch (...)
         {
+            jobError = std::current_exception();
+        }
+        if (jobError)
+        {
+            // Store breaker: a transient store error on a path that passed
+            // the Open preflight is weather, not a failed run. The job is
+            // requeued untouched (staging file intact, not accounted, not
+            // marked done — the identical safety argument as the m_DrainAbort
+            // rewind: same bytes at the same pre-assigned offsets), the
+            // oracle learns about the failure, and the store gate above
+            // holds dispatch until the store is back. Permanent errnos,
+            // breaker-off runs, teardown races and budget exhaustion keep
+            // the original abort semantics.
+            const int err = BbstagePosixErrnoOf(jobError);
+            bool finishing = false;
+            {
+                std::lock_guard<std::mutex> lck(m_Mutex);
+                finishing = m_Finishing;
+            }
+            if (m_StoreBreaker && err != 0 && BbstageStoreErrorRetryable(err) && !finishing)
+            {
+                ++jobRetries;
+                BbstageStoreHealth::Instance().ObserveFailure();
+                if (jobRetries <= maxJobRetries)
+                {
+                    std::lock_guard<std::mutex> lck(m_Mutex);
+                    m_DataQueue.push_front(std::move(job));
+                    continue;
+                }
+            }
             {
                 std::lock_guard<std::mutex> lck(m_Mutex);
                 if (!m_DrainError)
                 {
-                    m_DrainError = std::current_exception();
+                    m_DrainError = jobError;
                 }
             }
             m_DataCV.notify_all();
             m_CommitCV.notify_all();
             return;
         }
+        jobRetries = 0;
         if (!completed)
         {
             // Close requested an abort mid-copy (m_DrainAbort): put the job
@@ -1245,7 +1446,16 @@ void BbstageWriter::WorkerLoop()
                 }
                 catch (...)
                 {
-                    if (!m_DrainError)
+                    // A lagging progress record is cumulative and republishes
+                    // with the next completion: while the breaker holds the
+                    // store down this is deferred, not fatal. (DoClose
+                    // re-drives a deferred final publish before hand-off /
+                    // barriers.)
+                    if (m_StoreBreaker && !BbstageStoreHealth::Instance().StoreReady())
+                    {
+                        BbstageStoreHealth::Instance().ObserveFailure();
+                    }
+                    else if (!m_DrainError)
                     {
                         m_DrainError = std::current_exception();
                     }
@@ -1261,7 +1471,13 @@ void BbstageWriter::WorkerLoop()
                 }
                 catch (...)
                 {
-                    if (!m_DrainError)
+                    // node record is cumulative and folds again on the next
+                    // pass: defer while the breaker holds the store down
+                    if (m_StoreBreaker && !BbstageStoreHealth::Instance().StoreReady())
+                    {
+                        BbstageStoreHealth::Instance().ObserveFailure();
+                    }
+                    else if (!m_DrainError)
                     {
                         m_DrainError = std::current_exception();
                     }
@@ -1563,7 +1779,7 @@ void BbstageWriter::RunCommitJob(const DrainJob &job)
 
 void BbstageWriter::WaitForAllRanksDrained(size_t step)
 {
-    const auto start = std::chrono::steady_clock::now();
+    auto start = std::chrono::steady_clock::now(); // breaker-patience restarts it
     const bool forever = (m_CommitTimeoutSecs <= 0.f);
     const auto timeout = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
         std::chrono::duration<float>(m_CommitTimeoutSecs));
@@ -1590,7 +1806,12 @@ void BbstageWriter::WaitForAllRanksDrained(size_t step)
                 break;
             }
         }
-        if (!forever && (std::chrono::steady_clock::now() - start) > timeout)
+        if (m_StoreBreaker && !BbstageStoreHealth::Instance().StoreReady())
+        {
+            start = std::chrono::steady_clock::now(); // breaker patience: the
+            // fuse counts only store-answering time (see WaitForSessionDrained)
+        }
+        else if (!forever && (std::chrono::steady_clock::now() - start) > timeout)
         {
             helper::Throw<std::runtime_error>("Engine", "BbstageWriter",
                                               "WaitForAllRanksDrained",
@@ -1635,7 +1856,11 @@ void BbstageWriter::WaitForAllRanksDrained(size_t step)
                                                         std::to_string(step) + " abandoned");
                 }
             }
-            if (!forever && (std::chrono::steady_clock::now() - start) > timeout)
+            if (m_StoreBreaker && !BbstageStoreHealth::Instance().StoreReady())
+            {
+                start = std::chrono::steady_clock::now(); // breaker patience
+            }
+            else if (!forever && (std::chrono::steady_clock::now() - start) > timeout)
             {
                 helper::Throw<std::runtime_error>("Engine", "BbstageWriter",
                                                   "WaitForAllRanksDrained",
@@ -2357,6 +2582,7 @@ void BbstageWriter::DoClose(const int /*transportIndex*/)
         session.DeleteStagedFiles = m_DeleteStagedFiles;
         session.CommitPollMs = m_CommitPollMs;
         session.CommitTimeoutSecs = m_CommitTimeoutSecs;
+        session.StoreBreaker = m_StoreBreaker;
         BbstageStagedFinalizer::Instance().RegisterSession(std::move(session));
         m_StagingDir.clear(); // owned by the finalizer now
         closePhase("staged-handoff");

@@ -7,10 +7,13 @@
 #ifndef ADIOS2_ENGINE_BBSTAGE_BBSTAGEDRAINCOMMON_H_
 #define ADIOS2_ENGINE_BBSTAGE_BBSTAGEDRAINCOMMON_H_
 
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <exception>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -79,6 +82,58 @@ bool BbstageReadProgress(const std::string &path, BbstageDrainProgress &out);
 void BbstageWriteProgressRecord(int fd, const std::string &path, uint64_t rank,
                                uint64_t drainedSteps, uint64_t drainedBytes,
                                uint64_t &seq, const std::string &host);
+
+/** A failed POSIX drain/store operation. Still a std::runtime_error (every
+ * existing catch site keeps working, message format unchanged) but it
+ * carries the errno so the store breaker can tell transient store errors
+ * (retry when the store is back) from permanent ones (fail immediately
+ * regardless of breaker state). */
+struct BbstagePosixError : std::runtime_error
+{
+    int Errno;
+    BbstagePosixError(int err, const std::string &msg) : std::runtime_error(msg), Errno(err) {}
+};
+
+/** errno of a thrown exception, 0 when it is not a BbstagePosixError
+ * (logic/config errors are never store weather). */
+inline int BbstagePosixErrnoOf(const std::exception_ptr &e)
+{
+    try
+    {
+        std::rethrow_exception(e);
+    }
+    catch (const BbstagePosixError &pe)
+    {
+        return pe.Errno;
+    }
+    catch (...)
+    {
+        return 0;
+    }
+}
+
+/** Retryability for the store breaker: a store error mid-run on a path that
+ * passed the Open-time preflight is weather (EIO/ETIMEDOUT/ESTALE/EAGAIN/
+ * EPIPE/EACCES/EROFS/...) UNLESS it names a condition retrying cannot fix
+ * (no space, no quota, oversized request, bad arguments/path, vanished
+ * staging file). Conservative default: unknown errnos are retryable, and
+ * the caller's retry budget caps any misclassification. */
+inline bool BbstageStoreErrorRetryable(int err)
+{
+    switch (err)
+    {
+    case ENOSPC:
+    case EDQUOT:
+    case EFBIG:
+    case EINVAL:
+    case ENAMETOOLONG:
+    case ENOENT:
+    case ENOTDIR:
+        return false;
+    default:
+        return true;
+    }
+}
 
 } // end namespace engine
 } // end namespace core

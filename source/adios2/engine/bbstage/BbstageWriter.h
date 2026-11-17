@@ -276,6 +276,16 @@ private:
     uint64_t m_StagingWatermarkBytes = 1024ULL << 20; // StagingWatermarkMB (0 = unlimited)
     bool m_Aggregate = false;                        // Aggregate=on
 
+    // Store circuit breaker (StoreBreaker=on; default off => the oracle stays
+    // inert and the drain path is byte-identical to pre-breaker code).
+    bool m_StoreBreaker = false;
+    std::string m_BreakerProbePath;               // "" = <finalDir>/bbstage.probe
+    float m_BreakerSlowAfterSecs = 5.f;           // probe latency budget -> Slow
+    float m_BreakerDownAfterSecs = 30.f;          // sustained errors -> Down
+    float m_BreakerProbeSecs = 1.f;               // healthy probe cadence
+    unsigned int m_BreakerUpAfterProbes = 3;      // clean probes to leave Down
+    uint64_t m_BreakerHardWatermarkBytes = 0;     // 0 = 2x the nominal watermark
+
     // Aggregate-mode node topology (valid when m_Aggregate is true)
     helper::Comm m_NodeComm;        // per-node communicator (split of m_Comm)
     int m_NodeIndex = 0;            // compact node id 0..NodeCount-1 (sub-file + progress id)

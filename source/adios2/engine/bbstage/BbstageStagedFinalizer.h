@@ -117,6 +117,9 @@ public:
         bool DeleteStagedFiles = true;
         unsigned int CommitPollMs = 2;
         float CommitTimeoutSecs = 300.f;
+        // store breaker active (rank-0 uses the local oracle to keep the
+        // commit gates patient while the shared store is held down)
+        bool StoreBreaker = false;
 
         // lifecycle (worker threads only, under the finalizer mutex)
         bool DataDone = false;
@@ -155,6 +158,14 @@ public:
      *  AccountStaged() throws (0 = wait forever, default 300). */
     void SetStagingStallTimeout(float secs);
 
+    /** Store circuit breaker (see BbstageStoreHealth). When on, the
+     *  backpressure release target while the store is Down becomes the
+     *  larger `downWatermarkBytes` (due checkpoints wait on the staging
+     *  NVMe, the simulation keeps computing), drain dispatch pauses, and
+     *  transient store errors requeue instead of aborting the run.
+     *  Off by default: byte-identical pre-breaker behavior. */
+    void SetStoreBreaker(bool on, uint64_t downWatermarkBytes);
+
     ~BbstageStagedFinalizer();
     BbstageStagedFinalizer(const BbstageStagedFinalizer &) = delete;
     BbstageStagedFinalizer &operator=(const BbstageStagedFinalizer &) = delete;
@@ -170,6 +181,14 @@ private:
     // aggregate co-write, called under m_Mutex:
     void PublishLocalProgress(Session &s); // node-local per-rank record (every rank)
     void PublishNodeRecord(Session &s);    // node leader only
+    /** Publish the drained watermark if behind and mark DataDone when the
+     *  session is fully drained AND published (publish-last: a session may
+     *  only become done once its progress record is on the store, so the
+     *  breaker can defer completion across an outage by deferring the
+     *  publish). Called under m_Mutex; publish errors propagate (the drain
+     *  worker tolerates them only while the breaker holds the store down).
+     *  Returns bit 1 = published something, bit 2 = DataDone newly set. */
+    int AdvanceSessionLocked(Session &s);
     // release sessions done on this rank; keeps an aggregate node leader
     // session while its node record is still behind (called under m_Mutex)
     void EraseDoneSessions();
@@ -196,6 +215,11 @@ private:
     uint64_t m_StagingWatermark = 0; // 0 = unlimited
     uint64_t m_PendingStaged = 0;    // staged bytes not yet drained (this rank)
     float m_StagingStallTimeoutSecs = 300.f; // 0 = wait forever
+    bool m_StoreBreaker = false;           // SetStoreBreaker
+    uint64_t m_StoreDownWatermark = 0;     // release target while store Down
+    // store breaker: session whose progress publish was deferred by an
+    // outage; republished when the store is back (under m_Mutex)
+    std::shared_ptr<Session> m_PendingRepublish;
 
     std::exception_ptr m_Error;
 };
