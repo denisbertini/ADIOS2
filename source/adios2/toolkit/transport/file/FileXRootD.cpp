@@ -118,7 +118,7 @@ void FileXRootD::Open(const std::string &name, const Mode openMode, const bool /
     m_Name = BuildUrl(name);
 
     XrdCl::XRootDStatus status = m_Impl->File.Open(m_Name, XrdCl::OpenFlags::Read);
-    if (!status.IsOk())
+    if (!status.IsOK())
         helper::Throw<std::ios_base::failure>(
             "Toolkit", "transport::file::FileXRootD", "Open",
             "could not open " + m_Endpoint + " object for " + name +
@@ -130,8 +130,8 @@ void FileXRootD::Open(const std::string &name, const Mode openMode, const bool /
     // xrdfs/PathInfo stat: token-carrying stat on some EOS builds is
     // refused even when open+read on the same URL works.
     XrdCl::StatInfo *statInfo = nullptr;
-    status = m_Impl->File.Stat(&statInfo);
-    if (status.IsOk() && statInfo != nullptr)
+    status = m_Impl->File.Stat(true, statInfo, 0);
+    if (status.IsOK() && statInfo != nullptr)
     {
         m_Size = static_cast<size_t>(statInfo->GetSize());
         delete statInfo;
@@ -140,7 +140,7 @@ void FileXRootD::Open(const std::string &name, const Mode openMode, const bool /
     {
         if (statInfo != nullptr)
             delete statInfo;
-        m_Impl->File.Close();
+        (void)m_Impl->File.Close();
         helper::Throw<std::ios_base::failure>(
             "Toolkit", "transport::file::FileXRootD", "Open",
             "opened but could not stat " + m_Endpoint + " object for " + name + ": " +
@@ -177,15 +177,15 @@ void FileXRootD::Read(char *buffer, size_t size, size_t start)
     size_t done = 0;
     while (done < size)
     {
-        const uint64_t chunk = static_cast<uint64_t>(std::min(size - done, m_ChunkSize));
-        XrdCl::iovec iov;
-        iov.buffer = buffer + done;
-        iov.buffer_length = chunk;
-        XrdCl::iovec *out = &iov;
-        uint64_t got = 0;
+        // simple-API read (char*, count) -- same overload XrdClBackend uses;
+        // chunked so we never cross the server's readv request maximum, and
+        // a short count (server truncation at its own limit) just continues
+        // the loop.
+        const uint32_t chunk = static_cast<uint32_t>(std::min(size - done, m_ChunkSize));
+        uint32_t got = 0;
         XrdCl::XRootDStatus status = m_Impl->File.Read(static_cast<off_t>(offset + done), chunk,
-                                                       &out, &got);
-        if (!status.IsOk())
+                                                       buffer + done, got);
+        if (!status.IsOK())
         {
             ProfilerStop("read");
             helper::Throw<std::ios_base::failure>(
@@ -223,7 +223,7 @@ void FileXRootD::Close()
     std::lock_guard<std::mutex> lock(m_FileMutex);
     if (m_IsOpen)
     {
-        m_Impl->File.Close();
+        (void)m_Impl->File.Close();
         m_IsOpen = false;
     }
 }
