@@ -283,6 +283,9 @@ if(ADIOS2_HAVE_XRootD)
   # Native XRootD (XrdSsi) remote, plus the XrdCl HTTP-lane backend (uses libXrdCl,
   # the CLIENT component, to reach a Pelican federation or an HTTPS origin)
   target_sources(adios2_core PRIVATE toolkit/remote/XrootdRemote.cpp toolkit/remote/XrdClBackend.cpp)
+  # Plain-object file transport over XRootD/EOS (xrdcp-class access: open +
+  # positional read against stock servers, no server-side ADIOS2 plugin)
+  target_sources(adios2_core PRIVATE toolkit/transport/file/FileXRootD.cpp)
   target_include_directories(adios2_core PRIVATE ${XROOTD_INCLUDE_DIRS})
   target_link_libraries(adios2_core PRIVATE ${XROOTD_CLIENT_LIBRARIES} ${XROOTD_UTILS_LIBRARIES} ${XROOTD_SSI_LIBRARIES})
 endif()

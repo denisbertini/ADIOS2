@@ -29,6 +29,9 @@
 #ifdef ADIOS2_HAVE_AWSSDK
 #include "adios2/toolkit/transport/file/FileAWSSDK.h"
 #endif
+#ifdef ADIOS2_HAVE_XROOTD
+#include "adios2/toolkit/transport/file/FileXRootD.h"
+#endif
 
 #ifdef _WIN32
 #pragma warning(disable : 4503) // length of std::function inside std::async
@@ -121,6 +124,18 @@ std::shared_ptr<Transport> OpenFileImpl(helper::Comm const &comm, const std::str
         else if (library == "remote")
         {
             transport = std::make_shared<transport::FileRemote>(comm);
+            if (lf_GetBuffered("false"))
+            {
+                helper::Throw<std::invalid_argument>(
+                    "Toolkit", "transport", "OpenFile",
+                    library + " transport does not support buffered I/O.");
+            }
+        }
+#endif
+#ifdef ADIOS2_HAVE_XROOTD
+        else if (library == "xrootd")
+        {
+            transport = std::make_shared<transport::FileXRootD>(comm);
             if (lf_GetBuffered("false"))
             {
                 helper::Throw<std::invalid_argument>(
