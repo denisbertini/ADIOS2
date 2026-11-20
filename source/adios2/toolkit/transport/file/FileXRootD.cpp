@@ -10,7 +10,7 @@
 #include "adios2/helper/adiosString.h"
 
 #include <XrdCl/XrdClFile.hh>
-#include <XrdCl/XrdClStatInfo.hh>
+#include <XrdCl/XrdClXRootDTypes.hh> // XrdCl::StatInfo lives here
 
 #include <algorithm>
 #include <cstdlib>
