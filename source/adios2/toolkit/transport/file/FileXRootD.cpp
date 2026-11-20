@@ -85,12 +85,13 @@ std::string FileXRootD::BuildUrl(const std::string &name) const
                                              "empty file name: " + name);
 
     std::string url = "root://" + m_Endpoint;
-    if (m_Prefix.empty())
-        url += "/";
-    else if (m_Prefix[0] != '/')
-        url += "/" + m_Prefix;
-    else
-        url += m_Prefix; // yields the canonical root://host//eos/... form
+    // XRootD's canonical URL carries *two* slashes between host and absolute
+    // path (root://host//eos/...): the form xrdcp uses and EOS tokens are
+    // scoped against.  A single slash reaches the server as an out-of-scope
+    // path and answers "permission denied" even with a valid token.
+    url += "/";
+    if (!m_Prefix.empty())
+        url += (m_Prefix[0] == '/') ? m_Prefix : ("/" + m_Prefix);
     if (url.back() != '/')
         url += "/";
     url += base;
