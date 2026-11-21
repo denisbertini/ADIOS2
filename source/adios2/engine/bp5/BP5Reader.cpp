@@ -1579,6 +1579,10 @@ void BP5Reader::InitTransports()
     // All ranks participate in the broadcast unconditionally so the collective doesn't deadlock.
     if (m_Parameters.DataFileTransport.empty())
     {
+        // Optional engine defaults carried by the sidecar: a remote data
+        // transport makes per-file open costs significant, and callers above
+        // the C++ API (e.g. openPMD-api) cannot always forward engine params.
+        std::string sidecarThreads, sidecarMaxOpenFiles;
         if (m_Comm.Rank() == 0)
         {
             std::string sidecarPath = m_Name + PathSeparator + "s3.json";
@@ -1621,10 +1625,17 @@ void BP5Reader::InitTransports()
                     {
                         m_Parameters.S3Bucket = extractField("bucket");
                     }
+                    sidecarThreads = extractField("threads");
+                    sidecarMaxOpenFiles = extractField("maxopenfiles");
                     if (m_Parameters.verbose > 0)
                     {
                         std::cout << "BP5Reader: detected s3.json sidecar, DataFileTransport="
-                                  << m_Parameters.DataFileTransport << std::endl;
+                                  << m_Parameters.DataFileTransport;
+                        if (!sidecarThreads.empty())
+                            std::cout << ", threads=" << sidecarThreads;
+                        if (!sidecarMaxOpenFiles.empty())
+                            std::cout << ", maxopenfiles=" << sidecarMaxOpenFiles;
+                        std::cout << std::endl;
                     }
                 }
             }
@@ -1654,6 +1665,27 @@ void BP5Reader::InitTransports()
         {
             bcastString(m_Parameters.S3Endpoint);
             bcastString(m_Parameters.S3Bucket);
+            bcastString(sidecarThreads);
+            bcastString(sidecarMaxOpenFiles);
+            // Apply after InitParameters() and before the data FilePool is
+            // created below, so both m_Threads and MaxOpenFilesAtOnce take
+            // effect for this open.
+            if (!sidecarThreads.empty())
+            {
+                m_Threads = static_cast<unsigned int>(helper::SetWithinLimit(
+                    static_cast<size_t>(std::stoul(sidecarThreads)), static_cast<size_t>(1),
+                    static_cast<size_t>(256)));
+            }
+            if (!sidecarMaxOpenFiles.empty())
+            {
+                m_Parameters.MaxOpenFilesAtOnce = static_cast<unsigned int>(
+                    helper::SetWithinLimit(static_cast<size_t>(std::stoul(sidecarMaxOpenFiles)),
+                                          static_cast<size_t>(1), static_cast<size_t>(4096)));
+                if (m_Parameters.MaxOpenFilesAtOnce < m_Threads)
+                {
+                    m_Threads = m_Parameters.MaxOpenFilesAtOnce;
+                }
+            }
         }
     }
 
